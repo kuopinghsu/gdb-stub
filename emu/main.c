@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -276,7 +277,7 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (debug_mode && (cpu.instruction_count % 1000 == 0)) {
-                        printf("PC: 0x%08x, Instructions: %llu\n", cpu.pc, cpu.instruction_count);
+                        printf("PC: 0x%08x, Instructions: %lu\n", cpu.pc, cpu.instruction_count);
                     }
 
                     rv32_cpu_step(&cpu);
@@ -315,7 +316,7 @@ int main(int argc, char *argv[]) {
 
         if (interactive_mode && cpu_was_running && gdb_ctx.should_stop) {
             printf("\nCPU State:\n");
-            printf("PC: 0x%08x  Instructions executed: %llu\n", cpu.pc, cpu.instruction_count);
+            printf("PC: 0x%08x  Instructions executed: %lu\n", cpu.pc, cpu.instruction_count);
             printf("Press Enter to continue, 'q' to quit, 'r' to show registers: ");
             fflush(stdout);
 

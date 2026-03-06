@@ -4,6 +4,13 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 -g
 LDFLAGS = 
 
+# RISC-V GDB binary (can be overridden: make GDB=/path/to/gdb demo)
+# Auto-detect if not specified
+GDB ?= $(shell which riscv-none-elf-gdb 2>/dev/null || \
+               which riscv64-unknown-elf-gdb 2>/dev/null || \
+               which gdb-multiarch 2>/dev/null || \
+               echo gdb)
+
 # Directories
 SRC_DIR = src
 EMU_DIR = emu
@@ -103,9 +110,9 @@ demo: clean $(TARGET)
 	@echo "  2. Start the emulator in background on port 1234"
 	@echo "  3. Launch GDB with the demo script"
 	@echo ""
-	@./$(TARGET) -p 1234 & \
+	@-./$(TARGET) -p 1234 & \
 	sleep 2 && \
-	riscv-none-elf-gdb -x gdb_demo.gdb examples/test.s; \
+	$(GDB) -x gdb_demo.gdb; \
 	pkill -f rv32_emu || true
 
 # Start emulator in background for manual GDB connection
@@ -114,9 +121,9 @@ start-emu: $(TARGET)
 	@pkill -f rv32_emu || true
 	@./$(TARGET) -p 1234 &
 	@echo "Emulator started in background. Connect with:"
-	@echo "  riscv-none-elf-gdb -x gdb_demo.gdb examples/test.s"
+	@echo "  $(GDB) -x gdb_demo.gdb"
 	@echo "Or manually:"
-	@echo "  riscv-none-elf-gdb"
+	@echo "  $(GDB)"
 	@echo "  (gdb) target remote localhost:1234"
 
 # Stop the background emulator
@@ -127,7 +134,7 @@ stop-emu:
 
 # Connect to running emulator with GDB
 gdb-connect:
-	riscv-none-elf-gdb -x gdb_demo.gdb examples/test.s
+	$(GDB) -x gdb_demo.gdb examples/test.s
 
 # Help
 help:
@@ -147,8 +154,14 @@ help:
 	@echo "  test-program  - Create a sample RISC-V assembly program"
 	@echo "  help          - Show this help message"
 	@echo ""
+	@echo "Detected GDB: $(GDB)"
+	@echo ""
 	@echo "Quick start:"
 	@echo "  make demo     - Run complete demonstration"
+	@echo ""
+	@echo "Custom GDB path:"
+	@echo "  GDB=/path/to/riscv-none-elf-gdb make demo"
+	@echo "  GDB=/opt/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-gdb make demo"
 	@echo ""
 	@echo "Manual workflow:"
 	@echo "  make start-emu && make gdb-connect"

@@ -16,6 +16,8 @@ typedef struct {
     uint16_t port;
     bool connected;
     bool enabled;
+    bool no_ack_mode;           // QStartNoAckMode enabled
+    int consecutive_failures;   // Track failures for DoS protection
     char packet_buffer[GDB_BUFFER_SIZE];
     int packet_size;
 } gdb_stub_t;

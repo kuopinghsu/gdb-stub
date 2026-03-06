@@ -19,6 +19,8 @@ A complete implementation of a RISC-V RV32I emulator with integrated GDB stub su
   - Continue/halt execution control
   - Thread management (single-threaded)
   - Reset and restart capabilities
+  - **QStartNoAckMode** for improved performance
+  - **DoS protection** with failure tracking
 
 - **Cross-Platform Compatibility**
   - Compiles with GCC on Linux, macOS, and Windows
@@ -159,15 +161,27 @@ The emulator implements the standard RISC-V register convention:
 | `qAttached` | Query attach status | ✅ Complete |
 | `qTStatus` | Trace status | ✅ Complete |
 | `qSearch:memory` | Search memory | ✅ Complete |
+| `QStartNoAckMode` | Enable no-acknowledgment mode | ✅ Complete |
 
 ### Protocol Features
 
 1. **Packet Format**: All GDB packets use the standard `$<data>#<checksum>` format
 2. **Checksum Validation**: Full checksum validation with ACK/NACK responses
-3. **Error Handling**: Proper error responses for invalid commands
-4. **Thread Support**: Single-threaded model with proper thread ID handling
-5. **Memory Protection**: Bounds checking for all memory accesses
-6. **Register Mapping**: Standard RISC-V register layout with PC as register 32
+3. **QStartNoAckMode**: Optional mode to disable ACK/NACK for improved throughput
+4. **DoS Protection**: Automatic disconnection after 50 consecutive packet failures
+5. **Error Handling**: Proper error responses for invalid commands, robust EOF handling
+6. **Thread Support**: Single-threaded model with proper thread ID handling
+7. **Memory Protection**: Bounds checking for all memory accesses
+8. **Register Mapping**: Standard RISC-V register layout with PC as register 32
+
+### Protocol Improvements
+
+This implementation includes several enhancements over basic GDB Remote Serial Protocol:
+
+- **QStartNoAckMode Support**: When enabled by GDB, eliminates ACK/NACK overhead to significantly improve debugging performance, especially over high-latency connections
+- **Consecutive Failure Tracking**: Automatically disconnects after 50 consecutive packet failures to protect against denial-of-service scenarios and misbehaving clients
+- **Robust EOF Handling**: Properly detects connection closure and read errors (checks for `nread <= 0` instead of just `-1`)
+- **Checksum Verification**: Always verifies checksums before processing packets, sending NACK on mismatch unless in no-ack mode
 
 ### Breakpoint Management
 
