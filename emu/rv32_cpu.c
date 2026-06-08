@@ -373,7 +373,7 @@ bool rv32_cpu_load_program(rv32_cpu_t *cpu, const uint8_t *program, size_t size,
 
 // Print CPU state for debugging
 void rv32_cpu_print_state(rv32_cpu_t *cpu) {
-    printf("PC: 0x%08x  Instructions: %lu\n", cpu->pc, cpu->instruction_count);
+    printf("PC: 0x%08x  Instructions: %llu\n", cpu->pc, cpu->instruction_count);
 
     for (int i = 0; i < 32; i += 4) {
         printf("x%2d: 0x%08x  x%2d: 0x%08x  x%2d: 0x%08x  x%2d: 0x%08x\n",
