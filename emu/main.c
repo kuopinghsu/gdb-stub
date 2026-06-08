@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -411,11 +412,8 @@ static bool continue_all_harts(gdb_context_t *ctx, bool debug_mode) {
 
         int select_result = select(ctx->stub.client_fd + 1, &readfds, NULL, NULL, &timeout);
         if (select_result > 0 && FD_ISSET(ctx->stub.client_fd, &readfds)) {
-            char peek;
-            if (recv(ctx->stub.client_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) > 0) {
-                ctx->should_stop = true;
-                break;
-            }
+            ctx->should_stop = true;
+            break;
         }
     }
 

@@ -16,6 +16,7 @@
 
 // Forward declarations for static functions
 static void handle_query(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
+static void handle_general_set(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
 static void handle_read_registers(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
 static void handle_write_registers(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
 static void handle_read_memory(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
@@ -215,7 +216,9 @@ static int receive_packet(gdb_stub_t *stub) {
     uint8_t checksum_received = 0;
 
     while (1) {
-        if (read(stub->client_fd, &c, 1) != 1) {
+        ssize_t nread = read(stub->client_fd, &c, 1);
+        if (nread <= 0) {
+            stub->consecutive_failures++;
             return -1;
         }
 
@@ -248,15 +251,34 @@ static int receive_packet(gdb_stub_t *stub) {
         case 2: // Read checksum (2 hex digits)
             checksum_received = (checksum_received << 4) | hex_to_int(c);
             if (++index == 2) {
-                // Send ACK/NACK
-                c = (checksum_received == checksum_expected) ? '+' : '-';
-                write(stub->client_fd, &c, 1);
-
-                if (checksum_received == checksum_expected) {
-                    return 0;
-                } else {
+                // Verify checksum
+                if (checksum_received != checksum_expected) {
+                    // Send NACK if not in no-ack mode
+                    if (!stub->no_ack_mode) {
+                        c = '-';
+                        ssize_t result = write(stub->client_fd, &c, 1);
+                        if (result < 0) {
+                            stub->consecutive_failures++;
+                            return -1;
+                        }
+                    }
+                    stub->consecutive_failures++;
                     return -1;
                 }
+
+                // Send ACK if not in no-ack mode
+                if (!stub->no_ack_mode) {
+                    c = '+';
+                    ssize_t result = write(stub->client_fd, &c, 1);
+                    if (result < 0) {
+                        stub->consecutive_failures++;
+                        return -1;
+                    }
+                }
+
+                // Success - reset failure counter
+                stub->consecutive_failures = 0;
+                return 0;
             }
             break;
         }
@@ -349,7 +371,7 @@ static void handle_query(gdb_context_t *ctx, void *simulator,
         ctx->multiprocess_active = (strstr(client_caps, "multiprocess+") != NULL);
         send_packet(&ctx->stub,
                     "PacketSize=4096;swbreak+;multiprocess+;vContSupported+;"
-                    "qXfer:features:read+");
+                    "qXfer:features:read+;QStartNoAckMode+");
     } else if (strncmp(packet, "qAttached", 9) == 0) {
         send_packet(&ctx->stub, "1");
     } else if (strncmp(packet, "qC", 2) == 0) {
@@ -395,6 +417,21 @@ static void handle_query(gdb_context_t *ctx, void *simulator,
         handle_search_memory(ctx, simulator, callbacks);
     } else {
         send_packet(&ctx->stub, "");
+    }
+}
+
+// Handle general set commands (Q)
+static void handle_general_set(gdb_context_t *ctx, void *simulator,
+                               const gdb_callbacks_t *callbacks) {
+    (void)simulator;
+    (void)callbacks;
+    char *packet = ctx->stub.packet_buffer;
+
+    if (strncmp(packet, "QStartNoAckMode", 15) == 0) {
+        ctx->stub.no_ack_mode = true;
+        send_packet(&ctx->stub, "OK");
+    } else {
+        send_packet(&ctx->stub, ""); // Not supported
     }
 }
 
@@ -971,6 +1008,12 @@ int gdb_stub_process(gdb_context_t *ctx, void *simulator,
         return -1;
     }
 
+    // Check for too many consecutive failures (DoS protection)
+    if (ctx->stub.consecutive_failures >= 50) {
+        fprintf(stderr, "GDB stub: Too many consecutive failures, disconnecting\n");
+        return -1;
+    }
+
     if (receive_packet(&ctx->stub) < 0) {
         return -1;
     }
@@ -995,6 +1038,10 @@ int gdb_stub_process(gdb_context_t *ctx, void *simulator,
 
     case 'q': // Query
         handle_query(ctx, simulator, callbacks);
+        break;
+
+    case 'Q': // General set
+        handle_general_set(ctx, simulator, callbacks);
         break;
 
     case 'g': // Read registers

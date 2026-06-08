@@ -4,6 +4,13 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c99 -O2 -g
 LDFLAGS = 
 
+# RISC-V GDB binary (can be overridden: make GDB=/path/to/gdb demo)
+# Auto-detect if not specified
+GDB ?= $(shell which riscv-none-elf-gdb 2>/dev/null || \
+               which riscv64-unknown-elf-gdb 2>/dev/null || \
+               which gdb-multiarch 2>/dev/null || \
+               echo gdb)
+
 # Directories
 SRC_DIR = src
 EMU_DIR = emu
@@ -109,7 +116,7 @@ demo: clean $(TARGET)
 	@./$(TARGET) -p 1234 -c 1 & \
 	EMU_PID=$$!; \
 	sleep 2; \
-	riscv-none-elf-gdb -batch -x gdb_test.gdb || { kill $$EMU_PID 2>/dev/null; $(MAKE) stop-emu; exit 1; }; \
+	$(GDB) -batch -x gdb_test.gdb || { kill $$EMU_PID 2>/dev/null; $(MAKE) stop-emu; exit 1; }; \
 	kill $$EMU_PID 2>/dev/null; \
 	$(MAKE) stop-emu
 	@echo ""
@@ -117,7 +124,7 @@ demo: clean $(TARGET)
 	@./$(TARGET) -p 1234 -c 1 & \
 	EMU_PID=$$!; \
 	sleep 2; \
-	riscv-none-elf-gdb -batch -x gdb_demo.gdb examples/test.s; \
+	$(GDB) -batch -x gdb_demo.gdb examples/test.s; \
 	kill $$EMU_PID 2>/dev/null; \
 	$(MAKE) stop-emu
 	@$(MAKE) test-smp
@@ -126,7 +133,7 @@ demo: clean $(TARGET)
 	@./$(TARGET) -p 1234 -c 4 & \
 	EMU_PID=$$!; \
 	sleep 2; \
-	riscv-none-elf-gdb -batch -ex 'set $$expected_harts=4' -x gdb_demo_smp.gdb examples/test.s; \
+	$(GDB) -batch -ex 'set $$expected_harts=4' -x gdb_demo_smp.gdb examples/test.s; \
 	kill $$EMU_PID 2>/dev/null || $(MAKE) stop-emu
 
 # Run automated GDB tests only (single-core + SMP 2/4/8)
@@ -136,7 +143,7 @@ test: clean $(TARGET)
 	@./$(TARGET) -p 1234 -c 1 & \
 	EMU_PID=$$!; \
 	sleep 2; \
-	riscv-none-elf-gdb -batch -x gdb_test.gdb; \
+	$(GDB) -batch -x gdb_test.gdb; \
 	TEST_EXIT=$$?; \
 	kill $$EMU_PID 2>/dev/null || $(MAKE) stop-emu; \
 	if [ $$TEST_EXIT -ne 0 ]; then exit $$TEST_EXIT; fi
@@ -156,10 +163,10 @@ start-emu: $(TARGET)
 	@pkill -f rv32_emu || true
 	@./$(TARGET) -p 1234 -c $(HARTS) &
 	@echo "Emulator started in background. Connect with:"
-	@echo "  riscv-none-elf-gdb -x gdb_demo.gdb examples/test.s"
-	@echo "  riscv-none-elf-gdb -ex \"set \\\$$expected_harts=$(HARTS)\" -x gdb_demo_smp.gdb examples/test.s   # SMP"
+	@echo "  $(GDB) -x gdb_demo.gdb examples/test.s"
+	@echo "  $(GDB) -ex \"set \\\$$expected_harts=$(HARTS)\" -x gdb_demo_smp.gdb examples/test.s   # SMP"
 	@echo "Or manually:"
-	@echo "  riscv-none-elf-gdb"
+	@echo "  $(GDB)"
 	@echo "  (gdb) target remote localhost:1234"
 
 # Stop the background emulator
@@ -170,7 +177,7 @@ stop-emu:
 
 # Connect to running emulator with GDB
 gdb-connect:
-	riscv-none-elf-gdb -x gdb_demo.gdb examples/test.s
+	$(GDB) -x gdb_demo.gdb examples/test.s
 
 # Help
 help:
@@ -190,10 +197,16 @@ help:
 	@echo "  test-program  - Create a sample RISC-V assembly program"
 	@echo "  help          - Show this help message"
 	@echo ""
+	@echo "Detected GDB: $(GDB)"
+	@echo ""
 	@echo "Quick start:"
 	@echo "  make demo     - Run automated tests and demos (single + SMP)"
 	@echo "  make test     - Run automated tests only (single + SMP)"
 	@echo "  make start-emu HARTS=8  - Start 8-hart SMP emulator (1, 2, 4, or 8)"
+	@echo ""
+	@echo "Custom GDB path:"
+	@echo "  GDB=/path/to/riscv-none-elf-gdb make demo"
+	@echo "  GDB=/opt/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-gdb make demo"
 	@echo ""
 	@echo "Manual workflow:"
 	@echo "  make start-emu && make gdb-connect"

@@ -23,6 +23,7 @@ A complete implementation of a RISC-V RV32I emulator with integrated GDB stub su
   - Multiprocess stop replies (`thread:p1.N`) with `swbreak:`, `watch:`, and PC (`20:`) fields
   - SMP-ready thread protocol (`H`/`T`/`qC`/`qfThreadInfo`; `-c 1`, `2`, `4`, or `8`)
   - Worker harts run RV32I poll/handler code (`emu/smp_program.h`); IPI + spinlock-protected shared queue
+  - **QStartNoAckMode** for improved throughput; **DoS protection** after consecutive packet failures
   - Target reset (`R`) and Ctrl-C interrupt handling
 
 - **Automated test suite** — 21 single-core + 19 SMP checks each for 2, 4, and 8 harts via `make test`
@@ -192,6 +193,7 @@ The emulator implements the standard RISC-V register convention:
 | `qsThreadInfo` | List threads (next) | ✅ Complete |
 | `vCont` | Continue/step with thread id (`p pid.tid`) | ✅ Complete |
 | `vCont?` | Query supported vCont actions | ✅ Complete |
+| `QStartNoAckMode` | Enable no-acknowledgment mode | ✅ Complete |
 
 ### Protocol Features
 
@@ -202,9 +204,11 @@ The emulator implements the standard RISC-V register convention:
 5. **vCont**: Extended continue/step (`vCont;s:p1.2`, `vCont;c:p1.-1`, …) with `vCont?` capability query
 6. **Multiprocess ids**: Process id `1` for all harts; thread ids `p1.1`…`p1.N` in `H`, `T`, `qC`, `qfThreadInfo`, and stop replies (negotiated via `multiprocess+` in `qSupported`; preserved across `R` reset)
 7. **vCont step priority**: Combined packets such as `vCont;s:p1.1;c:p1.-1` treat the step action as authoritative (GDB sends this after breakpoint stops)
-8. **Binary writes**: `X` command with RSP escape and run-length decoding
-9. **Memory protection**: Bounds checking on all CPU and stub memory accesses
-10. **Register layout**: x0–x31 plus PC as register 32
+8. **QStartNoAckMode**: Optional mode to disable ACK/NACK for higher throughput
+9. **DoS protection**: Disconnect after 50 consecutive packet failures; robust EOF handling
+10. **Binary writes**: `X` command with RSP escape and run-length decoding
+11. **Memory protection**: Bounds checking on all CPU and stub memory accesses
+12. **Register layout**: x0–x31 plus PC as register 32
 
 ### Breakpoint Management
 
