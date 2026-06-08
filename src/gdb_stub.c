@@ -12,6 +12,8 @@
 #include <errno.h>
 #include <ctype.h>
 
+#define GDB_STUB_PID 1
+
 // Forward declarations for static functions
 static void handle_query(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
 static void handle_read_registers(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
@@ -27,6 +29,8 @@ static void handle_set_thread(gdb_context_t *ctx, void *simulator, const gdb_cal
 static void handle_thread_alive(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
 static void handle_halt_reason(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
 static void handle_search_memory(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
+static void handle_vcont(gdb_context_t *ctx, void *simulator,
+                         const gdb_callbacks_t *callbacks, int *run_cpu);
 static int send_packet(gdb_stub_t *stub, const char *data);
 static int receive_packet(gdb_stub_t *stub);
 
@@ -53,6 +57,16 @@ static uint32_t parse_hex(const char *str, int len) {
     return value;
 }
 
+static uint32_t parse_hex_le(const char *str, int hex_chars) {
+    uint32_t value = 0;
+    int bytes = hex_chars / 2;
+    for (int i = 0; i < bytes && str[i * 2] && str[i * 2 + 1]; i++) {
+        uint8_t byte = (hex_to_int(str[i * 2]) << 4) | hex_to_int(str[i * 2 + 1]);
+        value |= (uint32_t)byte << (i * 8);
+    }
+    return value;
+}
+
 static void encode_hex(char *buf, uint32_t value, int bytes) {
     // Encode in little-endian byte order (LSB first) for RISC-V
     for (int i = 0; i < bytes; i++) {
@@ -70,15 +84,126 @@ static uint8_t calculate_checksum(const char *data, int len) {
     return sum;
 }
 
+static bool ranges_overlap(uint32_t addr1, uint32_t len1, uint32_t addr2, uint32_t len2) {
+    if (len1 == 0 || len2 == 0) {
+        return false;
+    }
+    uint64_t end1 = (uint64_t)addr1 + len1;
+    uint64_t end2 = (uint64_t)addr2 + len2;
+    return addr1 < end2 && addr2 < end1;
+}
+
+static bool thread_pid_valid(int pid) {
+    return pid == 0 || pid == GDB_STUB_PID;
+}
+
+static int parse_thread_spec(const char *str, int *pid, int *tid) {
+    if (!str || !*str) {
+        *pid = 0;
+        *tid = -1;
+        return 0;
+    }
+    if (strcmp(str, "-1") == 0) {
+        *pid = 0;
+        *tid = -1;
+        return 0;
+    }
+    if (*str == 'p' || *str == 'P') {
+        str++;
+    }
+
+    char *dot = strchr(str, '.');
+    if (dot) {
+        *pid = (int)strtol(str, NULL, 16);
+        *tid = (int)strtol(dot + 1, NULL, 16);
+    } else {
+        *pid = 0;
+        *tid = (int)strtol(str, NULL, 16);
+    }
+    return 0;
+}
+
+static void format_stop_reply(gdb_context_t *ctx, char *response, size_t len,
+                              int signal, int tid, bool swbreak,
+                              uint32_t watch_addr, uint32_t pc_addr) {
+    if (ctx->multiprocess_active) {
+        if (swbreak) {
+            snprintf(response, len, "T%02xthread:p%x.%x;swbreak:;",
+                     signal & 0xFF, GDB_STUB_PID, tid);
+        } else if (watch_addr != 0) {
+            snprintf(response, len, "T%02xthread:p%x.%x;watch:%08x;",
+                     signal & 0xFF, GDB_STUB_PID, tid, watch_addr);
+        } else if (pc_addr != 0) {
+            snprintf(response, len, "T%02xthread:p%x.%x;20:%08x;",
+                     signal & 0xFF, GDB_STUB_PID, tid, pc_addr);
+        } else {
+            snprintf(response, len, "T%02xthread:p%x.%x;",
+                     signal & 0xFF, GDB_STUB_PID, tid);
+        }
+        return;
+    }
+
+    if (swbreak) {
+        snprintf(response, len, "T%02xthread:%x;swbreak:;",
+                 signal & 0xFF, tid);
+    } else if (watch_addr != 0) {
+        snprintf(response, len, "T%02xthread:%x;watch:%08x;",
+                 signal & 0xFF, tid, watch_addr);
+    } else if (pc_addr != 0) {
+        snprintf(response, len, "T%02xthread:%x;20:%08x;",
+                 signal & 0xFF, tid, pc_addr);
+    } else {
+        snprintf(response, len, "T%02xthread:%x;",
+                 signal & 0xFF, tid);
+    }
+}
+
+static int resolve_continue_thread(int pid, int tid) {
+    if (!thread_pid_valid(pid)) {
+        return -2;
+    }
+    if (tid <= 0) {
+        return -1;
+    }
+    return tid;
+}
+
+static int resolve_step_thread(gdb_context_t *ctx, int pid, int tid) {
+    int ct = resolve_continue_thread(pid, tid);
+    if (ct == -2) {
+        return -2;
+    }
+    if (ct > 0) {
+        return ct;
+    }
+    return ctx->current_thread;
+}
+
+static int write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t written = 0;
+
+    while (written < len) {
+        ssize_t n = write(fd, p + written, len - written);
+        if (n <= 0) {
+            return -1;
+        }
+        written += (size_t)n;
+    }
+    return 0;
+}
+
 // Send a packet to GDB
 static int send_packet(gdb_stub_t *stub, const char *data) {
     char buffer[GDB_BUFFER_SIZE];
     int len = strlen(data);
     uint8_t checksum = calculate_checksum(data, len);
 
-    snprintf(buffer, sizeof(buffer), "$%s#%02x", data, checksum);
-    int sent = write(stub->client_fd, buffer, strlen(buffer));
-    return sent > 0 ? 0 : -1;
+    int packet_len = snprintf(buffer, sizeof(buffer), "$%s#%02x", data, checksum);
+    if (packet_len < 0 || (size_t)packet_len >= sizeof(buffer)) {
+        return -1;
+    }
+    return write_all(stub->client_fd, buffer, (size_t)packet_len);
 }
 
 // Receive a packet from GDB
@@ -142,6 +267,11 @@ static int receive_packet(gdb_stub_t *stub) {
 int gdb_stub_init(gdb_context_t *ctx, uint16_t port) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->stub.port = port;
+    ctx->stub.socket_fd = -1;
+    ctx->stub.client_fd = -1;
+    ctx->current_thread = 1;
+    ctx->continue_thread = -1;
+    ctx->stop_thread = 0;
 
     // Create socket
     ctx->stub.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -209,13 +339,45 @@ static void handle_query(gdb_context_t *ctx, void *simulator,
     char *packet = ctx->stub.packet_buffer;
 
     if (strncmp(packet, "qSupported", 10) == 0) {
-        send_packet(&ctx->stub, "PacketSize=4096;qXfer:features:read+");
+        const char *client_caps = packet + 10;
+        if (*client_caps == ':') {
+            client_caps++;
+        }
+        while (*client_caps == ' ') {
+            client_caps++;
+        }
+        ctx->multiprocess_active = (strstr(client_caps, "multiprocess+") != NULL);
+        send_packet(&ctx->stub,
+                    "PacketSize=4096;swbreak+;multiprocess+;vContSupported+;"
+                    "qXfer:features:read+");
     } else if (strncmp(packet, "qAttached", 9) == 0) {
         send_packet(&ctx->stub, "1");
     } else if (strncmp(packet, "qC", 2) == 0) {
-        send_packet(&ctx->stub, "QC1");
+        char response[32];
+        int tid = ctx->stop_thread ? ctx->stop_thread : ctx->current_thread;
+        if (ctx->multiprocess_active) {
+            snprintf(response, sizeof(response), "QCp%x.%x", GDB_STUB_PID, tid);
+        } else {
+            snprintf(response, sizeof(response), "QC%x", tid);
+        }
+        send_packet(&ctx->stub, response);
     } else if (strncmp(packet, "qfThreadInfo", 12) == 0) {
-        send_packet(&ctx->stub, "m1");
+        char response[GDB_BUFFER_SIZE];
+        int num_harts = callbacks->get_num_harts ? callbacks->get_num_harts(simulator) : 1;
+        int pos;
+        if (ctx->multiprocess_active) {
+            pos = snprintf(response, sizeof(response), "mp%x.%x", GDB_STUB_PID, 1);
+            for (int h = 2; h <= num_harts && pos > 0 && pos < (int)sizeof(response); h++) {
+                pos += snprintf(response + pos, sizeof(response) - (size_t)pos,
+                                ",p%x.%x", GDB_STUB_PID, h);
+            }
+        } else {
+            pos = snprintf(response, sizeof(response), "m1");
+            for (int h = 2; h <= num_harts && pos > 0 && pos < (int)sizeof(response); h++) {
+                pos += snprintf(response + pos, sizeof(response) - (size_t)pos, ",%x", h);
+            }
+        }
+        send_packet(&ctx->stub, pos > 0 ? response : "l");
     } else if (strncmp(packet, "qsThreadInfo", 12) == 0) {
         send_packet(&ctx->stub, "l");
     } else if (strncmp(packet, "qXfer:features:read:target.xml", 30) == 0) {
@@ -264,12 +426,12 @@ static void handle_write_registers(gdb_context_t *ctx, void *simulator,
     char *data = ctx->stub.packet_buffer + 1;
 
     for (int i = 0; i < 32; i++) {
-        uint32_t value = parse_hex(data + i * 8, 8);
+        uint32_t value = parse_hex_le(data + i * 8, 8);
         callbacks->write_reg(simulator, i, value);
     }
 
     // Write PC
-    uint32_t pc = parse_hex(data + 32 * 8, 8);
+    uint32_t pc = parse_hex_le(data + 32 * 8, 8);
     callbacks->set_pc(simulator, pc);
 
     send_packet(&ctx->stub, "OK");
@@ -352,6 +514,10 @@ static void handle_breakpoint(gdb_context_t *ctx, bool insert) {
     uint32_t addr = parse_hex(comma1 + 1, comma2 - comma1 - 1);
     uint32_t len = parse_hex(comma2 + 1, strlen(comma2 + 1));
 
+    if ((type >= 2 && type <= 4) && len == 0) {
+        len = 4;
+    }
+
     int result = 0;
 
     // Handle breakpoints (type 0, 1) and watchpoints (type 2, 3, 4)
@@ -419,7 +585,7 @@ static void handle_write_single_register(gdb_context_t *ctx, void *simulator,
 
     *equals = '\0';
     int reg_num = (int)parse_hex(packet, equals - packet);
-    uint32_t value = parse_hex(equals + 1, strlen(equals + 1));
+    uint32_t value = parse_hex_le(equals + 1, (int)strlen(equals + 1));
 
     if (reg_num < 0 || reg_num > 32) {
         send_packet(&ctx->stub, "E01");
@@ -436,6 +602,35 @@ static void handle_write_single_register(gdb_context_t *ctx, void *simulator,
     }
 
     send_packet(&ctx->stub, "OK");
+}
+
+// Decode RSP binary payload (} escape and * run-length encoding)
+static int decode_rsp_binary(const char *src, uint8_t *dst, uint32_t dst_len) {
+    uint32_t di = 0;
+    const char *p = src;
+
+    while (di < dst_len && *p != '\0') {
+        char c = *p++;
+        if (c == '*') {
+            if (di == 0 || *p == '\0') {
+                return -1;
+            }
+            uint8_t count = (uint8_t)*p++;
+            uint8_t prev = dst[di - 1];
+            for (uint8_t i = 0; i < count && di < dst_len; i++) {
+                dst[di++] = prev;
+            }
+        } else if (c == '}') {
+            if (*p == '\0') {
+                return -1;
+            }
+            dst[di++] = (uint8_t)(*p++ ^ 0x20);
+        } else {
+            dst[di++] = (uint8_t)c;
+        }
+    }
+
+    return (di == dst_len) ? 0 : -1;
 }
 
 // Write memory with binary data (X command)
@@ -457,11 +652,19 @@ static void handle_write_memory_binary(gdb_context_t *ctx, void *simulator,
     uint32_t len = parse_hex(comma + 1, colon - comma - 1);
     char *data = colon + 1;
 
-    // For simplicity, treat binary data as hex-encoded for now
-    // In a full implementation, this would handle raw binary data
-    for (uint32_t i = 0; i < len && i * 2 < strlen(data); i++) {
-        uint8_t byte = (hex_to_int(data[i * 2]) << 4) | hex_to_int(data[i * 2 + 1]);
-        callbacks->write_mem(simulator, addr + i, byte, 1);
+    if (len == 0 || len > GDB_BUFFER_SIZE) {
+        send_packet(&ctx->stub, "E02");
+        return;
+    }
+
+    uint8_t bytes[GDB_BUFFER_SIZE];
+    if (decode_rsp_binary(data, bytes, len) < 0) {
+        send_packet(&ctx->stub, "E03");
+        return;
+    }
+
+    for (uint32_t i = 0; i < len; i++) {
+        callbacks->write_mem(simulator, addr + i, bytes[i], 1);
     }
 
     send_packet(&ctx->stub, "OK");
@@ -492,6 +695,9 @@ static void handle_reset(gdb_context_t *ctx, void *simulator,
     ctx->single_step = false;
     ctx->last_stop_signal = 5; // SIGTRAP
     ctx->breakpoint_hit = false;
+    ctx->current_thread = 1;
+    ctx->continue_thread = -1;
+    ctx->stop_thread = 0;
 
     send_packet(&ctx->stub, "OK");
 }
@@ -499,30 +705,68 @@ static void handle_reset(gdb_context_t *ctx, void *simulator,
 // Set thread for subsequent operations (H command)
 static void handle_set_thread(gdb_context_t *ctx, void *simulator,
                              const gdb_callbacks_t *callbacks) {
-    (void)simulator;  // Unused in single-threaded implementation
-    (void)callbacks;  // Unused in single-threaded implementation
     char *packet = ctx->stub.packet_buffer + 1;
+    char op = packet[0];
+    char *tid_str = packet + 1;
+    int pid = 0;
+    int tid = 0;
+    int num_harts = callbacks->get_num_harts ? callbacks->get_num_harts(simulator) : 1;
 
-    // Simple single-threaded implementation
-    // Format: Hg<thread-id> or Hc<thread-id>
-    if (packet[0] == 'g' || packet[0] == 'c') {
-        // For single-threaded system, accept thread ID 0, 1, or -1
-        send_packet(&ctx->stub, "OK");
-    } else {
+    if (op != 'g' && op != 'c') {
         send_packet(&ctx->stub, "E01");
+        return;
     }
+
+    parse_thread_spec(tid_str, &pid, &tid);
+    if (!thread_pid_valid(pid)) {
+        send_packet(&ctx->stub, "E01");
+        return;
+    }
+
+    if (op == 'g') {
+        if (tid <= 0) {
+            int stop_hart = callbacks->get_stop_hart ?
+                callbacks->get_stop_hart(simulator) : 0;
+            if (stop_hart < 0) {
+                stop_hart = callbacks->get_focus_hart ?
+                    callbacks->get_focus_hart(simulator) : 0;
+            }
+            tid = stop_hart + 1;
+        }
+        if (tid < 1 || tid > num_harts) {
+            send_packet(&ctx->stub, "E01");
+            return;
+        }
+        ctx->current_thread = tid;
+        if (callbacks->set_focus_hart) {
+            callbacks->set_focus_hart(simulator, tid - 1);
+        }
+    } else {
+        ctx->continue_thread = resolve_continue_thread(pid, tid);
+        if (ctx->continue_thread == -2) {
+            send_packet(&ctx->stub, "E01");
+            return;
+        }
+    }
+
+    send_packet(&ctx->stub, "OK");
 }
 
 // Check if thread is alive (T command)
 static void handle_thread_alive(gdb_context_t *ctx, void *simulator,
                                const gdb_callbacks_t *callbacks) {
-    (void)simulator;  // Unused in single-threaded implementation
-    (void)callbacks;  // Unused in single-threaded implementation
     char *packet = ctx->stub.packet_buffer + 1;
-    int thread_id = (int)parse_hex(packet, strlen(packet));
+    int pid = 0;
+    int thread_id = 0;
+    int num_harts = callbacks->get_num_harts ? callbacks->get_num_harts(simulator) : 1;
 
-    // For single-threaded system, only thread 1 is alive
-    if (thread_id == 1 || thread_id == 0) {
+    parse_thread_spec(packet, &pid, &thread_id);
+    if (!thread_pid_valid(pid)) {
+        send_packet(&ctx->stub, "E01");
+        return;
+    }
+
+    if (thread_id >= 1 && thread_id <= num_harts) {
         send_packet(&ctx->stub, "OK");
     } else {
         send_packet(&ctx->stub, "E01");
@@ -532,27 +776,144 @@ static void handle_thread_alive(gdb_context_t *ctx, void *simulator,
 // Enhanced halt reason reporting
 static void handle_halt_reason(gdb_context_t *ctx, void *simulator,
                               const gdb_callbacks_t *callbacks) {
-    char response[64];
+    char response[128];
+    int tid = ctx->stop_thread ? ctx->stop_thread : ctx->current_thread;
 
     if (ctx->single_step) {
-        // Single step completed
-        snprintf(response, sizeof(response), "S05");
+        format_stop_reply(ctx, response, sizeof(response), 5, tid, false, 0, 0);
     } else if (ctx->last_watchpoint_addr != 0) {
-        // Watchpoint hit
-        snprintf(response, sizeof(response), "T05watch:%08x;", ctx->last_watchpoint_addr);
-        ctx->last_watchpoint_addr = 0; // Clear after reporting
+        format_stop_reply(ctx, response, sizeof(response), 5, tid, false,
+                          ctx->last_watchpoint_addr, 0);
+        ctx->last_watchpoint_addr = 0;
     } else {
-        // Breakpoint or interrupt
         uint32_t pc = callbacks->get_pc(simulator);
         if (gdb_stub_check_breakpoint(ctx, pc)) {
-            // Use simple signal format instead of T packet for compatibility
-            snprintf(response, sizeof(response), "S05");
+            format_stop_reply(ctx, response, sizeof(response), 5, tid, true, 0, 0);
         } else {
-            snprintf(response, sizeof(response), "S05"); // Generic stop
+            format_stop_reply(ctx, response, sizeof(response), 5, tid, false, 0, 0);
         }
     }
 
     send_packet(&ctx->stub, response);
+}
+
+static void handle_vcont(gdb_context_t *ctx, void *simulator,
+                         const gdb_callbacks_t *callbacks, int *run_cpu) {
+    char *packet = ctx->stub.packet_buffer;
+
+    if (strcmp(packet, "vCont?") == 0) {
+        send_packet(&ctx->stub, "vCont;c;C; s;S");
+        return;
+    }
+
+    if (strncmp(packet, "vCont", 5) != 0) {
+        send_packet(&ctx->stub, "");
+        return;
+    }
+
+    const char *actions = packet + 5;
+    if (*actions == ';') {
+        actions++;
+    }
+    if (*actions == '\0') {
+        send_packet(&ctx->stub, "E01");
+        return;
+    }
+
+    bool any_step = false;
+    int step_tid = -1;
+    int continue_tid = -1;
+    bool have_action = false;
+
+    while (*actions) {
+        char action = *actions++;
+        if (action == 'C' || action == 'S' || action == 'T') {
+            if (isxdigit((unsigned char)actions[0]) &&
+                isxdigit((unsigned char)actions[1])) {
+                actions += 2;
+            }
+        }
+
+        int pid = 0;
+        int tid = -1;
+        if (*actions == ':') {
+            const char *spec = actions + 1;
+            const char *next = spec;
+            while (*next && *next != ';') {
+                next++;
+            }
+            char spec_buf[32];
+            size_t spec_len = (size_t)(next - spec);
+            if (spec_len >= sizeof(spec_buf)) {
+                send_packet(&ctx->stub, "E01");
+                return;
+            }
+            memcpy(spec_buf, spec, spec_len);
+            spec_buf[spec_len] = '\0';
+            parse_thread_spec(spec_buf, &pid, &tid);
+            actions = next;
+        }
+
+        if (!thread_pid_valid(pid)) {
+            send_packet(&ctx->stub, "E01");
+            return;
+        }
+
+        switch (action) {
+        case 'c':
+        case 'C': {
+            int ct = resolve_continue_thread(pid, tid);
+            if (ct == -2) {
+                send_packet(&ctx->stub, "E01");
+                return;
+            }
+            continue_tid = ct;
+            have_action = true;
+            break;
+        }
+        case 's':
+        case 'S':
+        case 't':
+        case 'T': {
+            int st = resolve_step_thread(ctx, pid, tid);
+            if (st == -2) {
+                send_packet(&ctx->stub, "E01");
+                return;
+            }
+            any_step = true;
+            step_tid = st;
+            have_action = true;
+            break;
+        }
+        default:
+            send_packet(&ctx->stub, "");
+            return;
+        }
+
+        if (*actions == ';') {
+            actions++;
+        }
+    }
+
+    if (!have_action) {
+        send_packet(&ctx->stub, "E01");
+        return;
+    }
+
+    if (any_step) {
+        ctx->single_step = true;
+        ctx->continue_thread = step_tid;
+    } else {
+        ctx->single_step = false;
+        ctx->continue_thread = continue_tid;
+    }
+
+    ctx->should_stop = false;
+    ctx->stop_thread = 0;
+    if (callbacks->resume) {
+        callbacks->resume(simulator);
+    }
+    *run_cpu = 1;
 }
 
 // Search memory for pattern (qSearch:memory command)
@@ -576,8 +937,13 @@ static void handle_search_memory(gdb_context_t *ctx, void *simulator,
 
     int pattern_len = strlen(pattern) / 2; // Hex encoded pattern
 
+    if (pattern_len == 0 || search_len < (uint32_t)pattern_len) {
+        send_packet(&ctx->stub, "0");
+        return;
+    }
+
     // Simple linear search implementation
-    for (uint32_t addr = start_addr; addr < start_addr + search_len - pattern_len; addr++) {
+    for (uint32_t addr = start_addr; addr <= start_addr + search_len - pattern_len; addr++) {
         bool match = true;
         for (int i = 0; i < pattern_len; i++) {
             uint8_t pattern_byte = (hex_to_int(pattern[i * 2]) << 4) | hex_to_int(pattern[i * 2 + 1]);
@@ -614,7 +980,13 @@ int gdb_stub_process(gdb_context_t *ctx, void *simulator,
     switch (cmd) {
     case 0x03: // Ctrl-C (interrupt)
         ctx->should_stop = true;
-        send_packet(&ctx->stub, "S05");
+        if (callbacks->halt_cpus) {
+            callbacks->halt_cpus(simulator);
+        }
+        if (ctx->stop_thread == 0) {
+            gdb_stub_set_stop_thread(ctx, 0);
+        }
+        gdb_stub_send_stop_reason(ctx, 2, 0); // SIGINT
         break;
 
     case '?': // Halt reason
@@ -665,23 +1037,39 @@ int gdb_stub_process(gdb_context_t *ctx, void *simulator,
         handle_thread_alive(ctx, simulator, callbacks);
         break;
 
+    case 'v': // Extended commands (vCont, ...)
+        if (strncmp(ctx->stub.packet_buffer, "vCont", 5) == 0) {
+            int run_cpu = 0;
+            handle_vcont(ctx, simulator, callbacks, &run_cpu);
+            if (run_cpu) {
+                return 1;
+            }
+        } else {
+            send_packet(&ctx->stub, "");
+        }
+        break;
+
     case 'c': // Continue
         ctx->should_stop = false;
         ctx->single_step = false;
+        ctx->stop_thread = 0;
+        ctx->continue_thread = -1;
         if (callbacks->resume) {
-            callbacks->resume(simulator);  // Clear halted flag
+            callbacks->resume(simulator);
         }
-        return 1; // Signal to continue execution
-        break;
+        return 1;
 
     case 's': // Single step
         ctx->should_stop = false;
         ctx->single_step = true;
-        if (callbacks->resume) {
-            callbacks->resume(simulator);  // Clear halted flag
+        ctx->stop_thread = 0;
+        if (ctx->continue_thread < 0) {
+            ctx->continue_thread = ctx->current_thread;
         }
-        return 1; // Signal to execute one instruction
-        break;
+        if (callbacks->resume) {
+            callbacks->resume(simulator);
+        }
+        return 1;
 
     case 'Z': // Insert breakpoint
         handle_breakpoint(ctx, true);
@@ -755,6 +1143,9 @@ bool gdb_stub_check_breakpoint(gdb_context_t *ctx, uint32_t pc) {
 
 // Watchpoint management
 int gdb_stub_add_watchpoint(gdb_context_t *ctx, uint32_t addr, uint32_t len, watchpoint_type_t type) {
+    if (len == 0) {
+        len = 4;
+    }
     if (ctx->watchpoint_count >= MAX_WATCHPOINTS) {
         return -1;
     }
@@ -801,11 +1192,7 @@ bool gdb_stub_check_watchpoint_read(gdb_context_t *ctx, uint32_t addr, uint32_t 
         watchpoint_t *wp = &ctx->watchpoints[i];
         if (wp->type != WATCHPOINT_READ && wp->type != WATCHPOINT_ACCESS) continue;
 
-        // Check if ranges overlap
-        uint32_t wp_end = wp->addr + wp->len;
-        uint32_t access_end = addr + len;
-
-        if (addr < wp_end && access_end > wp->addr) {
+        if (ranges_overlap(addr, len, wp->addr, wp->len)) {
             ctx->last_watchpoint_addr = wp->addr;
             return true;
         }
@@ -821,11 +1208,7 @@ bool gdb_stub_check_watchpoint_write(gdb_context_t *ctx, uint32_t addr, uint32_t
         watchpoint_t *wp = &ctx->watchpoints[i];
         if (wp->type != WATCHPOINT_WRITE && wp->type != WATCHPOINT_ACCESS) continue;
 
-        // Check if ranges overlap
-        uint32_t wp_end = wp->addr + wp->len;
-        uint32_t access_end = addr + len;
-
-        if (addr < wp_end && access_end > wp->addr) {
+        if (ranges_overlap(addr, len, wp->addr, wp->len)) {
             ctx->last_watchpoint_addr = wp->addr;
             return true;
         }
@@ -847,25 +1230,41 @@ void gdb_stub_close(gdb_context_t *ctx) {
 }
 
 int gdb_stub_send_stop_signal(gdb_context_t *ctx, int signal) {
-    char response[32];
-    snprintf(response, sizeof(response), "S%02x", signal & 0xFF);
-    return send_packet(&ctx->stub, response);
+    return gdb_stub_send_stop_reason(ctx, signal, 0);
+}
+
+void gdb_stub_set_stop_thread(gdb_context_t *ctx, int thread_id) {
+    if (thread_id >= 1) {
+        ctx->stop_thread = thread_id;
+    } else if (ctx->current_thread >= 1) {
+        ctx->stop_thread = ctx->current_thread;
+    } else {
+        ctx->stop_thread = 1;
+    }
+}
+
+bool gdb_stub_should_run_thread(gdb_context_t *ctx, int thread_id) {
+    if (ctx->continue_thread < 0) {
+        return true;
+    }
+    return ctx->continue_thread == thread_id;
 }
 
 int gdb_stub_send_stop_reason(gdb_context_t *ctx, int signal, uint32_t addr) {
     char response[128];
+    int tid = ctx->stop_thread ? ctx->stop_thread : ctx->current_thread;
 
     if (ctx->breakpoint_hit) {
-        // Use simple signal format instead of hwbreak for compatibility
-        snprintf(response, sizeof(response), "S%02x", signal & 0xFF);
+        format_stop_reply(ctx, response, sizeof(response), signal, tid, true, 0, 0);
         ctx->breakpoint_hit = false;
     } else if (ctx->last_watchpoint_addr != 0) {
-        snprintf(response, sizeof(response), "T%02xwatch:%08x;", signal & 0xFF, ctx->last_watchpoint_addr);
+        format_stop_reply(ctx, response, sizeof(response), signal, tid, false,
+                          ctx->last_watchpoint_addr, 0);
         ctx->last_watchpoint_addr = 0;
     } else if (addr != 0) {
-        snprintf(response, sizeof(response), "T%02x20:%08x;", signal & 0xFF, addr); // PC register (20 in hex)
+        format_stop_reply(ctx, response, sizeof(response), signal, tid, false, 0, addr);
     } else {
-        snprintf(response, sizeof(response), "S%02x", signal & 0xFF);
+        format_stop_reply(ctx, response, sizeof(response), signal, tid, false, 0, 0);
     }
 
     return send_packet(&ctx->stub, response);

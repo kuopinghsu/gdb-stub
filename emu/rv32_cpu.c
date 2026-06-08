@@ -1,13 +1,12 @@
 #include "rv32_cpu.h"
-#include "gdb_stub.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// External reference to GDB context
-extern gdb_context_t *g_gdb_ctx;
+static uint8_t *rv32_cpu_ram(rv32_cpu_t *cpu) {
+    return cpu->shared_ram ? cpu->shared_ram : cpu->memory;
+}
 
-#define UART_BASE 0x10000000
 void rv32_cpu_init(rv32_cpu_t *cpu) {
     memset(cpu, 0, sizeof(rv32_cpu_t));
     cpu->pc = RAM_BASE;  // Start execution from RAM base
@@ -18,39 +17,49 @@ void rv32_cpu_init(rv32_cpu_t *cpu) {
 
 // Reset CPU to initial state
 void rv32_cpu_reset(rv32_cpu_t *cpu) {
+    int hart_id = cpu->hart_id;
+    uint8_t *shared_ram = cpu->shared_ram;
+    void *watchpoint_ctx = cpu->watchpoint_ctx;
+    rv32_watchpoint_check_fn check_read = cpu->check_watchpoint_read;
+    rv32_watchpoint_check_fn check_write = cpu->check_watchpoint_write;
+
     memset(cpu->regs, 0, sizeof(cpu->regs));
     cpu->pc = RAM_BASE;
     cpu->regs[RV32_REG_SP] = RAM_BASE + RAM_SIZE - 4;
+    cpu->regs[RV32_REG_TP] = (uint32_t)hart_id;
     cpu->running = true;
     cpu->halted = false;
     cpu->single_step_mode = false;
     cpu->instruction_count = 0;
+    cpu->hart_id = hart_id;
+    cpu->shared_ram = shared_ram;
+    cpu->watchpoint_ctx = watchpoint_ctx;
+    cpu->check_watchpoint_read = check_read;
+    cpu->check_watchpoint_write = check_write;
     // Don't clear memory to preserve loaded program
 }
 
 // Read memory with proper bounds checking
 uint32_t rv32_cpu_read_mem(rv32_cpu_t *cpu, uint32_t addr, int size) {
-    // Check for read watchpoints if GDB is connected
-    if (g_gdb_ctx && g_gdb_ctx->stub.connected) {
-        if (gdb_stub_check_watchpoint_read(g_gdb_ctx, addr, size)) {
-            // Watchpoint hit - signal will be sent by GDB stub
-            cpu->halted = true;
-        }
+    if (cpu->check_watchpoint_read &&
+        cpu->check_watchpoint_read(cpu->watchpoint_ctx, addr, (uint32_t)size)) {
+        cpu->halted = true;
     }
 
     if (addr >= RAM_BASE && addr < RAM_BASE + RAM_SIZE - size + 1) {
+        uint8_t *ram = rv32_cpu_ram(cpu);
         uint32_t offset = addr - RAM_BASE;
         uint32_t value = 0;
 
         switch (size) {
         case 1:
-            value = cpu->memory[offset];
+            value = ram[offset];
             break;
         case 2:
-            value = *(uint16_t*)&cpu->memory[offset];
+            value = *(uint16_t*)&ram[offset];
             break;
         case 4:
-            value = *(uint32_t*)&cpu->memory[offset];
+            value = *(uint32_t*)&ram[offset];
             break;
         default:
             fprintf(stderr, "Invalid memory read size: %d\n", size);
@@ -77,26 +86,24 @@ uint32_t rv32_cpu_read_mem(rv32_cpu_t *cpu, uint32_t addr, int size) {
 
 // Write memory with proper bounds checking
 void rv32_cpu_write_mem(rv32_cpu_t *cpu, uint32_t addr, uint32_t value, int size) {
-    // Check for write watchpoints if GDB is connected
-    if (g_gdb_ctx && g_gdb_ctx->stub.connected) {
-        if (gdb_stub_check_watchpoint_write(g_gdb_ctx, addr, size)) {
-            // Watchpoint hit - signal will be sent by GDB stub
-            cpu->halted = true;
-        }
+    if (cpu->check_watchpoint_write &&
+        cpu->check_watchpoint_write(cpu->watchpoint_ctx, addr, (uint32_t)size)) {
+        cpu->halted = true;
     }
 
     if (addr >= RAM_BASE && addr < RAM_BASE + RAM_SIZE - size + 1) {
+        uint8_t *ram = rv32_cpu_ram(cpu);
         uint32_t offset = addr - RAM_BASE;
 
         switch (size) {
         case 1:
-            cpu->memory[offset] = value & 0xFF;
+            ram[offset] = value & 0xFF;
             break;
         case 2:
-            *(uint16_t*)&cpu->memory[offset] = value & 0xFFFF;
+            *(uint16_t*)&ram[offset] = value & 0xFFFF;
             break;
         case 4:
-            *(uint32_t*)&cpu->memory[offset] = value;
+            *(uint32_t*)&ram[offset] = value;
             break;
         default:
             fprintf(stderr, "Invalid memory write size: %d\n", size);
@@ -338,9 +345,8 @@ void rv32_cpu_step(rv32_cpu_t *cpu) {
                 printf("ECALL executed at PC=0x%08x\n", current_pc);
                 // Don't halt CPU to allow forever loop to continue
             } else if (imm == 0x1) {
-                // EBREAK - breakpoint
-                printf("\nEBREAK executed\n");
-                cpu->running = false;
+                // EBREAK - trap to debugger
+                cpu->halted = true;
             }
         }
         break;
@@ -361,7 +367,7 @@ bool rv32_cpu_load_program(rv32_cpu_t *cpu, const uint8_t *program, size_t size,
     }
 
     uint32_t offset = base_addr - RAM_BASE;
-    memcpy(&cpu->memory[offset], program, size);
+    memcpy(&rv32_cpu_ram(cpu)[offset], program, size);
     return true;
 }
 

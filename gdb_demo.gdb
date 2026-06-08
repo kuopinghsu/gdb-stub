@@ -1,13 +1,9 @@
-# GDB Script for RISC-V Emulator Demo
-# Load this script with: gdb -x gdb_demo.gdb
-#
-# This demo showcases:
-# - Basic debugging (breakpoints, stepping)
-# - Memory examination
-# - Watchpoint functionality (read/write/access monitoring)
+# GDB Script for RISC-V Emulator Demo (single hart, -c 1)
+# Load this script with: riscv-none-elf-gdb -batch -x gdb_demo.gdb examples/test.s
 
 set confirm off
 set pagination off
+set mem inaccessible-by-default off
 
 echo \n=== RISC-V Emulator GDB Demo ===\n
 echo This demo will showcase watchpoint functionality\n
@@ -38,51 +34,30 @@ continue
 echo \n--- Registers at Loop Start ---\n
 info registers t1 t2 s0
 
-# Set up watchpoints for memory location 0x80001000
+# Set up watchpoints (GDB resumes automatically after each watch command)
 echo \n--- Setting Up Watchpoints ---\n
 echo Setting write watchpoint on 0x80001000...\n
+delete breakpoints
 watch *(int*)0x80001000
 
-echo Setting read watchpoint on 0x80001000...\n
-rwatch *(int*)0x80001000
-
-echo Setting access watchpoint on 0x80001004...\n
-awatch *(int*)0x80001004
-
-# Show all watchpoints
-info watchpoints
-
-# Continue execution - should hit write watchpoint
-echo \n--- Continuing - Should Hit Write Watchpoint ---\n
-continue
-
-# Show what happened
 echo \n--- After Write Watchpoint Hit ---\n
 info registers t1 t3
 x/2w 0x80001000
 
-# Continue execution - should hit read watchpoint
-echo \n--- Continuing - Should Hit Read Watchpoint ---\n
-continue
+echo Setting read watchpoint on 0x80001000...\n
+rwatch *(int*)0x80001000
 
-# Show registers after read
 echo \n--- After Read Watchpoint Hit ---\n
 info registers t1 t3
 
-# Continue through several iterations to see watchpoints in action
-echo \n--- Continuing Through Loop Iterations ---\n
+echo Setting access watchpoint on 0x80001004...\n
+delete watchpoints
+break *0x80000028
 continue
+delete breakpoints
+awatch *(int*)0x80001004
 
-# Show final memory state
-echo \n--- Final Memory State ---\n
-x/4w 0x80001000
-
-# Continue to end of program
-echo \n--- Continuing to Program End ---\n
-continue
-
-# Show final state
-echo \n--- Final Program State ---\n
+echo \n--- After Access Watchpoint Hit ---\n
 info registers t1 t2
 x/2w 0x80001000
 
@@ -91,4 +66,3 @@ echo Memory 0x80001000 was monitored for read/write operations\n
 echo Memory 0x80001004 was monitored for any access\n
 
 quit
-

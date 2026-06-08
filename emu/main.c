@@ -4,141 +4,478 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 
 #include "../src/gdb_stub.h"
 #include "rv32_cpu.h"
+#include "rv32_system.h"
+#include "smp_sync.h"
+#include "smp_program.h"
 
-// Global variables for signal handling
-static rv32_cpu_t *g_cpu = NULL;
-gdb_context_t *g_gdb_ctx = NULL;  // Made global for CPU watchpoint access
+static bool valid_hart_count(int n) {
+    return n == 1 || n == 2 || n == 4 || n == 8;
+}
+
+static rv32_system_t g_sys;
+static gdb_context_t *g_gdb_ctx = NULL;
 static volatile bool g_interrupt_received = false;
 
-// Signal handler for Ctrl+C
+static rv32_cpu_t *sys_focus_cpu(void) {
+    return &g_sys.harts[g_sys.focus_hart];
+}
+
+static rv32_cpu_t *sys_hart_cpu(int hart) {
+    return &g_sys.harts[hart];
+}
+
+static int sys_thread_id(int hart) {
+    return hart + 1;
+}
+
+static bool sys_any_running(void) {
+    for (int h = 0; h < g_sys.num_harts; h++) {
+        if (g_sys.harts[h].running && !g_sys.harts[h].halted) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sys_halt_all(void) {
+    for (int h = 0; h < g_sys.num_harts; h++) {
+        g_sys.harts[h].halted = true;
+    }
+}
+
+static void sys_resume_runnable(void) {
+    for (int h = 0; h < g_sys.num_harts; h++) {
+        if (g_gdb_ctx && !gdb_stub_should_run_thread(g_gdb_ctx, sys_thread_id(h))) {
+            continue;
+        }
+        g_sys.harts[h].halted = false;
+    }
+}
+
+static uint32_t sys_read_mem(rv32_system_t *sys, uint32_t addr, int size) {
+    if (addr >= SMP_SYNC_BASE && addr < SMP_SYNC_BASE + 0x40) {
+        return smp_sync_read_ram(sys, addr, size);
+    }
+    if (addr == SMP_IPI_MMIO) {
+        return smp_sync_read_mmio(sys, addr, size);
+    }
+    return rv32_cpu_read_mem(&sys->harts[0], addr, size);
+}
+
+static void sys_write_mem(rv32_system_t *sys, rv32_cpu_t *src, uint32_t addr,
+                          uint32_t value, int size) {
+    if (smp_sync_handle_mmio(&sys->sync, sys, addr, value, size)) {
+        return;
+    }
+    if (addr >= SMP_SYNC_BASE && addr < SMP_SYNC_BASE + 0x40) {
+        smp_sync_write_ram(sys, addr, value, size);
+        return;
+    }
+
+    rv32_cpu_write_mem(src ? src : &sys->harts[0], addr, value, size);
+}
+
+static void sys_post_step(rv32_system_t *sys, rv32_cpu_t *cpu, uint32_t prev_pc) {
+    if (sys->num_harts <= 1) {
+        return;
+    }
+    if (cpu->hart_id == 0 && prev_pc == 0x80000014) {
+        smp_sync_on_counter_store(&sys->sync, sys, 0, cpu->regs[RV32_REG_T1]);
+    }
+}
+
+static void sys_cpu_step(rv32_system_t *sys, rv32_cpu_t *cpu) {
+    uint32_t prev_pc = cpu->pc;
+    rv32_cpu_step(cpu);
+    sys_post_step(sys, cpu, prev_pc);
+}
+
+static void notify_stop(gdb_context_t *ctx, int signal, uint32_t pc) {
+    int tid = g_sys.stop_hart >= 0 ? sys_thread_id(g_sys.stop_hart) : sys_thread_id(g_sys.focus_hart);
+    gdb_stub_set_stop_thread(ctx, tid);
+    gdb_stub_send_stop_reason(ctx, signal, pc);
+}
+
+static bool handle_hart_stop(gdb_context_t *ctx, rv32_cpu_t *cpu, int signal) {
+    g_sys.stop_hart = cpu->hart_id;
+    g_sys.focus_hart = cpu->hart_id;
+    ctx->should_stop = true;
+    notify_stop(ctx, signal, cpu->pc);
+    return true;
+}
+
 void sigint_handler(int sig) {
     (void)sig;
     g_interrupt_received = true;
     if (g_gdb_ctx && g_gdb_ctx->stub.connected) {
         g_gdb_ctx->should_stop = true;
+        sys_halt_all();
+        g_sys.stop_hart = g_sys.focus_hart;
     }
 }
 
-// GDB callback functions
 uint32_t gdb_read_reg(void *sim, int reg_num) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    rv32_cpu_t *cpu = &sys->harts[sys->focus_hart];
 
     if (reg_num >= 0 && reg_num < 32) {
         return rv32_cpu_read_reg(cpu, reg_num);
-    } else if (reg_num == 32) {  // PC register
+    } else if (reg_num == 32) {
         return cpu->pc;
     }
     return 0;
 }
 
 void gdb_write_reg(void *sim, int reg_num, uint32_t value) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    rv32_cpu_t *cpu = &sys->harts[sys->focus_hart];
 
     if (reg_num >= 0 && reg_num < 32) {
         rv32_cpu_write_reg(cpu, reg_num, value);
-    } else if (reg_num == 32) {  // PC register
+    } else if (reg_num == 32) {
         cpu->pc = value;
     }
 }
 
 uint32_t gdb_read_mem(void *sim, uint32_t addr, int size) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    return rv32_cpu_read_mem(cpu, addr, size);
+    return sys_read_mem((rv32_system_t *)sim, addr, size);
 }
 
 void gdb_write_mem(void *sim, uint32_t addr, uint32_t value, int size) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    rv32_cpu_write_mem(cpu, addr, value, size);
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    sys_write_mem(sys, &sys->harts[sys->focus_hart], addr, value, size);
 }
 
 uint32_t gdb_get_pc(void *sim) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    return cpu->pc;
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    return sys->harts[sys->focus_hart].pc;
 }
 
 void gdb_set_pc(void *sim, uint32_t pc) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    cpu->pc = pc;
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    sys->harts[sys->focus_hart].pc = pc;
 }
 
 void gdb_single_step(void *sim) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    rv32_cpu_step(cpu);
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    sys_cpu_step(sys, &sys->harts[sys->focus_hart]);
 }
 
 bool gdb_is_running(void *sim) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    return cpu->running;
+    (void)sim;
+    return sys_any_running();
 }
 
 void gdb_reset(void *sim) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    rv32_cpu_reset(cpu);
+    rv32_system_t *sys = (rv32_system_t *)sim;
+
+    smp_sync_reset(&sys->sync, sys->num_harts);
+    for (int h = 0; h < sys->num_harts; h++) {
+        rv32_cpu_reset(&sys->harts[h]);
+        sys->harts[h].regs[RV32_REG_TP] = (uint32_t)h;
+        if (h > 0) {
+            smp_sync_init_worker_hart(sys, &sys->harts[h]);
+        }
+    }
+    smp_sync_ram_init(sys);
+    sys->focus_hart = 0;
+    sys->stop_hart = -1;
 }
 
 void gdb_resume(void *sim) {
-    rv32_cpu_t *cpu = (rv32_cpu_t *)sim;
-    cpu->halted = false;  // Clear halted flag to resume execution
+    (void)sim;
+    sys_resume_runnable();
 }
 
-// Create a simple test program
-void create_test_program(rv32_cpu_t *cpu) {
-    // RISC-V program with memory operations for watchpoint demo
+int gdb_get_num_harts(void *sim) {
+    return ((rv32_system_t *)sim)->num_harts;
+}
+
+void gdb_set_focus_hart(void *sim, int hart) {
+    rv32_system_t *sys = (rv32_system_t *)sim;
+    if (hart >= 0 && hart < sys->num_harts) {
+        sys->focus_hart = hart;
+    }
+}
+
+int gdb_get_focus_hart(void *sim) {
+    return ((rv32_system_t *)sim)->focus_hart;
+}
+
+int gdb_get_stop_hart(void *sim) {
+    return ((rv32_system_t *)sim)->stop_hart;
+}
+
+void gdb_halt_cpus(void *sim) {
+    (void)sim;
+    sys_halt_all();
+    g_sys.stop_hart = g_sys.focus_hart;
+}
+
+static bool gdb_watchpoint_read(void *ctx, uint32_t addr, uint32_t len) {
+    rv32_cpu_t *cpu = (rv32_cpu_t *)ctx;
+    gdb_context_t *gdb = g_gdb_ctx;
+    if (!gdb || !gdb->stub.connected) {
+        return false;
+    }
+    if (gdb_stub_check_watchpoint_read(gdb, addr, len)) {
+        g_sys.stop_hart = cpu->hart_id;
+        return true;
+    }
+    return false;
+}
+
+static bool gdb_watchpoint_write(void *ctx, uint32_t addr, uint32_t len) {
+    rv32_cpu_t *cpu = (rv32_cpu_t *)ctx;
+    gdb_context_t *gdb = g_gdb_ctx;
+    if (!gdb || !gdb->stub.connected) {
+        return false;
+    }
+    if (gdb_stub_check_watchpoint_write(gdb, addr, len)) {
+        g_sys.stop_hart = cpu->hart_id;
+        return true;
+    }
+    return false;
+}
+
+static void setup_hart_watchpoints(rv32_cpu_t *cpu) {
+    cpu->watchpoint_ctx = cpu;
+    cpu->check_watchpoint_read = gdb_watchpoint_read;
+    cpu->check_watchpoint_write = gdb_watchpoint_write;
+}
+
+void create_test_program(rv32_system_t *sys) {
+    rv32_cpu_t *cpu0 = &sys->harts[0];
     uint32_t program[] = {
         // _start:
-        0x800002b7,  // lui  t0, 0x80000       # Load base address
-        0x00000313,  // addi t1, zero, 0       # Counter = 0
-        0x00500393,  // addi t2, zero, 5       # Limit = 5 (reduced for demo)
-        0x80001437,  // lui  s0, 0x80001       # Memory area for watchpoint demo
-        0x00040413,  // addi s0, s0, 0         # s0 = 0x80001000 (watchpoint target)
+        0x800002b7,  // lui  t0, 0x80000
+        0x00000313,  // addi t1, zero, 0
+        0x00500393,  // addi t2, zero, 5
+        0x80001437,  // lui  s0, 0x80001       # s0 = 0x80001000
+        0x00040413,  // addi s0, s0, 0
 
-        // loop: (address 0x80000014)
-        0x00642023,  // sw   t1, 0(s0)         # Store counter to 0x80001000 (write watchpoint)
-        0x00042e03,  // lw   t3, 0(s0)         # Load from 0x80001000 (read watchpoint)
-        0x00130313,  // addi t1, t1, 1         # counter++
-        0x00731463,  // beq  t1, t2, end       # if counter == limit, go to end (offset +8)
-        0xff1ff06f,  // jal  loop              # jump back to loop
+        // loop: (0x80000014)
+        0x00642023,  // sw   t1, 0(s0)         # triggers worker IPI dispatch
+        0x00042e03,  // lw   t3, 0(s0)
+        0x00130313,  // addi t1, t1, 1
+        0x00731463,  // beq  t1, t2, end
+        0xff1ff06f,  // jal  loop
 
-        // end: (address 0x80000028)
-        0x00642223,  // sw   t1, 4(s0)         # Store final value to 0x80001004 (access watchpoint)
-        0xffdff06f,  // jal  end               # Infinite loop at end (no ecall)
+        // end: (0x80000028)
+        0x00642223,  // sw   t1, 4(s0)
+        0x0000006f,  // jal  end              # spin at 0x8000002c
     };
 
-    // Load program into memory
-    rv32_cpu_load_program(cpu, (uint8_t *)program, sizeof(program), RAM_BASE);
+    rv32_cpu_load_program(cpu0, (uint8_t *)program, sizeof(program), RAM_BASE);
+    memcpy(cpu0->memory + (SMP_WORKER_WAIT - RAM_BASE),
+           smp_worker_code, sizeof(smp_worker_code));
+
+    smp_sync_reset(&sys->sync, sys->num_harts);
+    smp_sync_ram_init(sys);
+
+    for (int h = 1; h < sys->num_harts; h++) {
+        smp_sync_init_worker_hart(sys, &sys->harts[h]);
+    }
+}
+
+static void init_system(rv32_system_t *sys, int num_harts) {
+    if (!valid_hart_count(num_harts)) {
+        num_harts = 1;
+    }
+
+    memset(sys, 0, sizeof(*sys));
+    sys->num_harts = num_harts;
+    sys->focus_hart = 0;
+    sys->stop_hart = -1;
+
+    for (int h = 0; h < num_harts; h++) {
+        rv32_cpu_init(&sys->harts[h]);
+        sys->harts[h].hart_id = h;
+        sys->harts[h].regs[RV32_REG_TP] = (uint32_t)h;
+        if (h > 0) {
+            sys->harts[h].shared_ram = sys->harts[0].memory;
+        }
+        setup_hart_watchpoints(&sys->harts[h]);
+    }
+
+    create_test_program(sys);
+}
+
+static bool should_step_hart(int h, gdb_context_t *ctx, bool single_step_mode) {
+    if (!gdb_stub_should_run_thread(ctx, sys_thread_id(h))) {
+        return false;
+    }
+    if (g_sys.num_harts == 1) {
+        return true;
+    }
+    if (single_step_mode) {
+        return h == g_sys.focus_hart;
+    }
+    if (ctx->continue_thread < 0) {
+        if (h == 0) {
+            return true;
+        }
+        return smp_sync_worker_should_run(&g_sys, h);
+    }
+    return ctx->continue_thread == sys_thread_id(h);
+}
+
+static bool step_focus_hart(gdb_context_t *ctx, bool debug_mode) {
+    rv32_cpu_t *cpu = sys_focus_cpu();
+
+    if (!gdb_stub_should_run_thread(ctx, sys_thread_id(cpu->hart_id))) {
+        gdb_stub_set_stop_thread(ctx, sys_thread_id(cpu->hart_id));
+        gdb_stub_send_stop_reason(ctx, 0, cpu->pc);
+        return true;
+    }
+
+    if (debug_mode) {
+        char disasm[128];
+        uint32_t instruction = rv32_cpu_read_mem(cpu, cpu->pc, 4);
+        rv32_cpu_disassemble(instruction, cpu->pc, disasm, sizeof(disasm));
+        printf("Hart %d executing: 0x%08x: %s\n", cpu->hart_id, cpu->pc, disasm);
+    }
+
+    if (gdb_stub_check_breakpoint(ctx, cpu->pc)) {
+        ctx->should_stop = true;
+        return handle_hart_stop(ctx, cpu, 5);
+    }
+
+    sys_cpu_step(&g_sys, cpu);
+
+    if (cpu->halted || !cpu->running) {
+        ctx->should_stop = true;
+        ctx->single_step = false;
+        if (cpu->halted) {
+            return handle_hart_stop(ctx, cpu, 5);
+        }
+        return handle_hart_stop(ctx, cpu, 4);
+    }
+
+    ctx->single_step = false;
+    ctx->should_stop = true;
+    return handle_hart_stop(ctx, cpu, 5);
+}
+
+static bool continue_all_harts(gdb_context_t *ctx, bool debug_mode) {
+    bool stop_sent = false;
+
+    while (sys_any_running() && !ctx->should_stop && !g_interrupt_received) {
+        for (int h = 0; h < g_sys.num_harts; h++) {
+            rv32_cpu_t *cpu = sys_hart_cpu(h);
+
+            if (!should_step_hart(h, ctx, false)) {
+                continue;
+            }
+            if (!cpu->running || cpu->halted) {
+                continue;
+            }
+
+            if (gdb_stub_check_breakpoint(ctx, cpu->pc)) {
+                stop_sent = handle_hart_stop(ctx, cpu, 5);
+                break;
+            }
+
+            if (debug_mode && (cpu->instruction_count % 1000 == 0)) {
+                printf("Hart %d PC: 0x%08x, Instructions: %llu\n",
+                       h, cpu->pc, cpu->instruction_count);
+            }
+
+            sys_cpu_step(&g_sys, cpu);
+
+            if (cpu->halted) {
+                stop_sent = handle_hart_stop(ctx, cpu, 5);
+                break;
+            }
+
+            if (!cpu->running) {
+                stop_sent = handle_hart_stop(ctx, cpu, 4);
+                break;
+            }
+        }
+
+        if (stop_sent) {
+            break;
+        }
+
+        fd_set readfds;
+        struct timeval timeout = {0, 0};
+
+        FD_ZERO(&readfds);
+        FD_SET(ctx->stub.client_fd, &readfds);
+
+        int select_result = select(ctx->stub.client_fd + 1, &readfds, NULL, NULL, &timeout);
+        if (select_result > 0 && FD_ISSET(ctx->stub.client_fd, &readfds)) {
+            char peek;
+            if (recv(ctx->stub.client_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT) > 0) {
+                ctx->should_stop = true;
+                break;
+            }
+        }
+    }
+
+    if (!stop_sent && !sys_any_running()) {
+        ctx->should_stop = true;
+        rv32_cpu_t *cpu = sys_focus_cpu();
+        notify_stop(ctx, 4, cpu->pc);
+        printf("CPU halted\n");
+        stop_sent = true;
+    } else if (!stop_sent && g_interrupt_received) {
+        g_interrupt_received = false;
+        ctx->should_stop = true;
+        rv32_cpu_t *cpu = sys_focus_cpu();
+        notify_stop(ctx, 2, cpu->pc);
+        printf("Execution interrupted\n");
+        stop_sent = true;
+    } else if (!stop_sent && ctx->should_stop) {
+        rv32_cpu_t *cpu = sys_focus_cpu();
+        notify_stop(ctx, 2, cpu->pc);
+        stop_sent = true;
+    }
+
+    return stop_sent;
 }
 
 void print_usage(const char *prog_name) {
     printf("Usage: %s [options]\n", prog_name);
     printf("Options:\n");
     printf("  -p PORT     GDB server port (default: 1234)\n");
+    printf("  -c HARTS    Number of harts: 1, 2, 4, or 8 (default: 1)\n");
     printf("  -d          Enable debug output\n");
     printf("  -i          Interactive mode (step through instructions)\n");
     printf("  -h          Show this help\n");
     printf("\n");
     printf("To connect with GDB:\n");
-    printf("  gdb\n");
+    printf("  riscv-none-elf-gdb\n");
     printf("  (gdb) target remote localhost:1234\n");
     printf("  (gdb) continue\n");
 }
 
 int main(int argc, char *argv[]) {
     uint16_t gdb_port = 1234;
+    int num_harts = 1;
     bool debug_mode = false;
     bool interactive_mode = false;
 
-    // Parse command line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "p:dih")) != -1) {
+    while ((opt = getopt(argc, argv, "p:c:dih")) != -1) {
         switch (opt) {
         case 'p':
             gdb_port = (uint16_t)atoi(optarg);
             if (gdb_port == 0) {
                 fprintf(stderr, "Invalid port number: %s\n", optarg);
+                return 1;
+            }
+            break;
+        case 'c':
+            num_harts = atoi(optarg);
+            if (!valid_hart_count(num_harts)) {
+                fprintf(stderr, "Invalid hart count: %s (use 1, 2, 4, or 8)\n", optarg);
                 return 1;
             }
             break;
@@ -160,16 +497,16 @@ int main(int argc, char *argv[]) {
     printf("RISC-V RV32I Emulator with GDB Stub\n");
     printf("===================================\n");
 
-    // Initialize CPU
-    rv32_cpu_t cpu;
-    rv32_cpu_init(&cpu);
-    g_cpu = &cpu;
+    init_system(&g_sys, num_harts);
+    printf("Test program loaded at 0x%08x (%d hart%s)\n",
+           RAM_BASE, g_sys.num_harts, g_sys.num_harts == 1 ? "" : "s");
+    if (g_sys.num_harts > 1) {
+        printf("Hart 0 runs demo; harts 1-%d are worker harts at 0x%08x (RV32I poll/handler)\n",
+               g_sys.num_harts - 1, SMP_WORKER_POLL);
+        printf("Shared sync at 0x%08x, IPI MMIO at 0x%08x\n",
+               SMP_SYNC_BASE, SMP_IPI_MMIO);
+    }
 
-    // Load test program
-    create_test_program(&cpu);
-    printf("Test program loaded at 0x%08x\n", RAM_BASE);
-
-    // Initialize GDB stub
     gdb_context_t gdb_ctx;
     if (gdb_stub_init(&gdb_ctx, gdb_port) < 0) {
         fprintf(stderr, "Failed to initialize GDB stub\n");
@@ -177,7 +514,6 @@ int main(int argc, char *argv[]) {
     }
     g_gdb_ctx = &gdb_ctx;
 
-    // Set up GDB callbacks
     gdb_callbacks_t callbacks = {
         .read_reg = gdb_read_reg,
         .write_reg = gdb_write_reg,
@@ -189,12 +525,15 @@ int main(int argc, char *argv[]) {
         .is_running = gdb_is_running,
         .reset = gdb_reset,
         .resume = gdb_resume,
+        .get_num_harts = gdb_get_num_harts,
+        .set_focus_hart = gdb_set_focus_hart,
+        .get_focus_hart = gdb_get_focus_hart,
+        .get_stop_hart = gdb_get_stop_hart,
+        .halt_cpus = gdb_halt_cpus,
     };
 
-    // Set up signal handling
     signal(SIGINT, sigint_handler);
 
-    // Wait for GDB connection
     if (gdb_stub_accept(&gdb_ctx) < 0) {
         fprintf(stderr, "Failed to accept GDB connection\n");
         gdb_stub_close(&gdb_ctx);
@@ -202,6 +541,9 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\nGDB connected! CPU execution will be controlled by GDB.\n");
+    if (g_sys.num_harts > 1) {
+        printf("SMP mode: use 'info threads' and 'thread N' to switch harts.\n");
+    }
     printf("In GDB, use these commands:\n");
     printf("  info registers  - Show CPU registers\n");
     printf("  x/10i $pc      - Disassemble 10 instructions at PC\n");
@@ -210,112 +552,34 @@ int main(int argc, char *argv[]) {
     printf("  continue       - Continue execution\n");
     printf("  quit           - Exit GDB\n\n");
 
-    // Make stdin non-blocking for interactive mode
     if (interactive_mode) {
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     }
 
-    // Main execution loop
     bool running = true;
     bool cpu_was_running = false;
 
     while (running && gdb_ctx.stub.connected) {
-        // Process GDB commands
-        int gdb_result = gdb_stub_process(&gdb_ctx, &cpu, &callbacks);
+        int gdb_result = gdb_stub_process(&gdb_ctx, &g_sys, &callbacks);
 
         if (gdb_result < 0) {
-            // GDB disconnected or error
             break;
         } else if (gdb_result == 1) {
-            // GDB wants to continue/step
             cpu_was_running = true;
+            sys_resume_runnable();
 
             if (gdb_ctx.single_step) {
-                // Single step mode
-                if (debug_mode) {
-                    char disasm[128];
-                    uint32_t instruction = rv32_cpu_read_mem(&cpu, cpu.pc, 4);
-                    rv32_cpu_disassemble(instruction, cpu.pc, disasm, sizeof(disasm));
-                    printf("Executing: 0x%08x: %s\n", cpu.pc, disasm);
-                }
-
-                // Check for breakpoint before execution
-                if (gdb_stub_check_breakpoint(&gdb_ctx, cpu.pc)) {
-                    gdb_ctx.should_stop = true;
-                    gdb_stub_send_stop_reason(&gdb_ctx, 5, cpu.pc);  // SIGTRAP
-                    continue;
-                }
-
-                rv32_cpu_step(&cpu);
-
-                if (!cpu.running || cpu.halted) {
-                    if (cpu.halted) {
-                        // Watchpoint or breakpoint hit
-                        gdb_stub_send_stop_reason(&gdb_ctx, 5, cpu.pc);  // SIGTRAP
-                    } else {
-                        gdb_stub_send_stop_signal(&gdb_ctx, 9);  // SIGKILL
-                        printf("CPU halted\n");
-                        break;
-                    }
-                }
-
-                // Single step completed
-                gdb_ctx.single_step = false;
-                gdb_ctx.should_stop = true;
-                gdb_stub_send_stop_reason(&gdb_ctx, 5, cpu.pc);  // SIGTRAP
-
+                step_focus_hart(&gdb_ctx, debug_mode);
             } else {
-                // Continue mode - run until breakpoint or interrupt
-                while (cpu.running && !cpu.halted && !gdb_ctx.should_stop && !g_interrupt_received) {
-                    // Check for breakpoint
-                    if (gdb_stub_check_breakpoint(&gdb_ctx, cpu.pc)) {
-                        gdb_ctx.should_stop = true;
-                        gdb_stub_send_stop_reason(&gdb_ctx, 5, cpu.pc);  // SIGTRAP
-                        break;
-                    }
-
-                    if (debug_mode && (cpu.instruction_count % 1000 == 0)) {
-                        printf("PC: 0x%08x, Instructions: %llu\n", cpu.pc, cpu.instruction_count);
-                    }
-
-                    rv32_cpu_step(&cpu);
-
-                    // If watchpoint was hit, stop execution
-                    if (cpu.halted) {
-                        gdb_ctx.should_stop = true;
-                        gdb_stub_send_stop_reason(&gdb_ctx, 5, cpu.pc);  // SIGTRAP
-                        break;
-                    }
-
-                    // Check for GDB commands (non-blocking)
-                    fd_set readfds;
-                    struct timeval timeout = {0, 0}; // Non-blocking
-
-                    FD_ZERO(&readfds);
-                    FD_SET(gdb_ctx.stub.client_fd, &readfds);
-
-                    int select_result = select(gdb_ctx.stub.client_fd + 1, &readfds, NULL, NULL, &timeout);
-                    if (select_result > 0 && FD_ISSET(gdb_ctx.stub.client_fd, &readfds)) {
-                        // GDB has sent a command (likely Ctrl-C)
-                        break;
-                    }
-                }
-
-                if (!cpu.running) {
-                    gdb_stub_send_stop_signal(&gdb_ctx, 9);  // SIGKILL
-                    printf("CPU halted\n");
-                } else if (g_interrupt_received) {
-                    gdb_stub_send_stop_signal(&gdb_ctx, 2);  // SIGINT
-                    g_interrupt_received = false;
-                    printf("Execution interrupted\n");
-                }
+                continue_all_harts(&gdb_ctx, debug_mode);
             }
         }
 
         if (interactive_mode && cpu_was_running && gdb_ctx.should_stop) {
-            printf("\nCPU State:\n");
-            printf("PC: 0x%08x  Instructions executed: %llu\n", cpu.pc, cpu.instruction_count);
+            rv32_cpu_t *cpu = sys_focus_cpu();
+            printf("\nCPU State (hart %d):\n", cpu->hart_id);
+            printf("PC: 0x%08x  Instructions executed: %llu\n", cpu->pc, cpu->instruction_count);
             printf("Press Enter to continue, 'q' to quit, 'r' to show registers: ");
             fflush(stdout);
 
@@ -324,13 +588,12 @@ int main(int argc, char *argv[]) {
                 if (input[0] == 'q') {
                     running = false;
                 } else if (input[0] == 'r') {
-                    rv32_cpu_print_state(&cpu);
+                    rv32_cpu_print_state(cpu);
                 }
             }
         }
     }
 
-    // Cleanup
     printf("\nShutting down...\n");
     gdb_stub_close(&gdb_ctx);
     return 0;

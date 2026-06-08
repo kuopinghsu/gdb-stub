@@ -85,6 +85,15 @@ test_eq $pc 0x8000001c "stepi executes load"
 stepi
 test_eq $t1 1 "stepi executes addi"
 
+# --- vCont / multiprocess thread ids ---
+run_to_loop
+maint packet Hcp1.1
+stepi
+test_eq $pc 0x80000018 "Hcp1.1 per-thread continue step"
+maint packet Hgp1.1
+test_eq $_thread 1 "Hgp1.1 selects thread p1.1"
+maint packet Tp1.1
+
 # --- Access watchpoint (Z4) ---
 run_to_loop
 break *0x80000028

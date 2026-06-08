@@ -5,11 +5,8 @@ set confirm off
 set pagination off
 set mem inaccessible-by-default off
 
-if !$_exists($expected_harts)
-  set $expected_harts = 4
-end
-
 set $last_thread = $expected_harts
+set $worker_pc = 0x80000034
 
 printf "\n=== RISC-V Emulator SMP Demo (%d harts) ===\n", $expected_harts
 
@@ -23,11 +20,14 @@ thread 1
 info registers tp pc t1 t2 s0
 x/8i $pc
 
-echo \n--- Secondary harts idle at 0x8000002c ---\n
+echo \n--- Worker harts poll at 0x80000034 (RV32I handler at 0x80000054) ---\n
 thread 2
-info registers tp pc
+info registers tp pc s1 s2
 thread $last_thread
 info registers tp pc
+
+echo \n--- Shared sync region at 0x80002000 ---\n
+x/4w 0x80002000
 
 echo \n--- Breakpoint on hart 0 loop ---\n
 thread 1
@@ -35,14 +35,21 @@ break *0x80000014
 continue
 info registers t1 t2 s0
 
+echo \n--- Dispatch work via loop store (IPI + spinlock) ---\n
+stepi
+echo After one store:\n
+x/4w 0x80002000
+thread 2
+info registers s1 s2
+
 echo \n--- Per-hart continue: step only hart 1 (thread 2) ---\n
 thread 2
-maint packet Hc2
+maint packet Hcp1.2
 stepi
-echo Hart 1 stepped in idle loop; hart 0 PC unchanged:\n
+echo Hart 1 stepped in worker loop; hart 0 PC unchanged:\n
 thread 1
 info registers pc
-maint packet Hc-1
+maint packet Hcp1.-1
 
 echo \n--- Watchpoint on hart 0 ---\n
 thread 1

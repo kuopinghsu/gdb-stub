@@ -19,6 +19,7 @@
 #define RV32_REG_T2    7
 #define RV32_REG_S0    8
 #define RV32_REG_S1    9
+#define RV32_REG_S2    18
 #define RV32_REG_A0    10
 #define RV32_REG_A1    11
 
@@ -26,16 +27,25 @@
 #define RAM_SIZE    (64 * 1024)  // 64KB RAM
 #define RAM_BASE    0x80000000
 #define UART_BASE   0x10000000
+#define IDLE_LOOP_ADDR      0x8000002c
+#define RV32_MAX_HARTS      8
+
+typedef bool (*rv32_watchpoint_check_fn)(void *ctx, uint32_t addr, uint32_t len);
 
 // CPU state
 typedef struct {
     uint32_t regs[RV32_REG_COUNT];
     uint32_t pc;
     uint8_t  memory[RAM_SIZE];
+    uint8_t *shared_ram;            // Shared RAM for SMP (NULL = use memory[])
+    int      hart_id;               // 0-based hart index
     bool     running;
     bool     single_step_mode;
     bool     halted;                // CPU halted due to watchpoint or breakpoint
     uint64_t instruction_count;
+    void *watchpoint_ctx;
+    rv32_watchpoint_check_fn check_watchpoint_read;
+    rv32_watchpoint_check_fn check_watchpoint_write;
 } rv32_cpu_t;
 
 // Instruction formats

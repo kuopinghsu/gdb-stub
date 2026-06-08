@@ -56,6 +56,11 @@ typedef struct {
     uint32_t last_watchpoint_addr;  // Address of last hit watchpoint
     int last_stop_signal;           // Last stop signal sent
     bool breakpoint_hit;            // Flag indicating breakpoint was hit
+    /* SMP thread state (GDB thread ids are 1-based hart ids). */
+    int current_thread;             // Selected thread for register ops
+    int continue_thread;            // -1 = all harts, else 1-based thread id
+    int stop_thread;                // Thread that caused the last stop (1-based)
+    bool multiprocess_active;       // Client negotiated multiprocess+ via qSupported
 } gdb_context_t;
 
 // Callback functions for simulator access
@@ -68,8 +73,13 @@ typedef struct {
     void (*set_pc)(void *sim, uint32_t pc);
     void (*single_step)(void *sim);
     bool (*is_running)(void *sim);
-    void (*reset)(void *sim);  // Optional: reset the simulator state
-    void (*resume)(void *sim);  // Optional: resume execution (clear halted flag)
+    void (*reset)(void *sim);
+    void (*resume)(void *sim);
+    int (*get_num_harts)(void *sim);
+    void (*set_focus_hart)(void *sim, int hart);
+    int (*get_focus_hart)(void *sim);
+    int (*get_stop_hart)(void *sim);
+    void (*halt_cpus)(void *sim);
 } gdb_callbacks_t;
 
 #ifdef __cplusplus
@@ -109,6 +119,12 @@ int gdb_stub_send_stop_signal(gdb_context_t *ctx, int signal);
 
 // Enhanced stop reason reporting
 int gdb_stub_send_stop_reason(gdb_context_t *ctx, int signal, uint32_t addr);
+
+// Record which thread (1-based hart id) caused a stop
+void gdb_stub_set_stop_thread(gdb_context_t *ctx, int thread_id);
+
+// True if continue/step should run the given thread (continue_thread == -1 means all)
+bool gdb_stub_should_run_thread(gdb_context_t *ctx, int thread_id);
 
 #ifdef __cplusplus
 }
