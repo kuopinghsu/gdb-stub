@@ -9,6 +9,30 @@
 
 #define GDB_BUFFER_SIZE 4096
 
+#if defined( GDB_STUB_RISCV32 ) && defined( GDB_STUB_RISCV64 )
+    #error "Define only one of GDB_STUB_RISCV32 or GDB_STUB_RISCV64"
+#elif defined( GDB_STUB_RISCV32 )
+    #define GDB_STUB_XLEN 32
+    typedef uint32_t gdb_reg_t;
+    typedef uint32_t gdb_addr_t;
+#elif defined( GDB_STUB_RISCV64 )
+    #define GDB_STUB_XLEN 64
+    typedef uint64_t gdb_reg_t;
+    typedef uint64_t gdb_addr_t;
+#elif defined( __riscv_xlen ) && ( __riscv_xlen == 32 )
+    #define GDB_STUB_XLEN 32
+    typedef uint32_t gdb_reg_t;
+    typedef uint32_t gdb_addr_t;
+#elif defined( __riscv_xlen ) && ( __riscv_xlen == 64 )
+    #define GDB_STUB_XLEN 64
+    typedef uint64_t gdb_reg_t;
+    typedef uint64_t gdb_addr_t;
+#else
+    #define GDB_STUB_XLEN 64
+    typedef uint64_t gdb_reg_t;
+    typedef uint64_t gdb_addr_t;
+#endif
+
 // GDB stub state
 typedef struct {
     int socket_fd;
@@ -24,7 +48,7 @@ typedef struct {
 
 // Breakpoint management
 typedef struct {
-    uint32_t addr;
+    gdb_addr_t addr;
     bool enabled;
 } breakpoint_t;
 
@@ -37,8 +61,8 @@ typedef enum {
 
 // Watchpoint management
 typedef struct {
-    uint32_t addr;
-    uint32_t len;
+    gdb_addr_t addr;
+    gdb_addr_t len;
     watchpoint_type_t type;
     bool enabled;
 } watchpoint_t;
@@ -55,7 +79,7 @@ typedef struct {
     int watchpoint_count;
     bool single_step;
     bool should_stop;
-    uint32_t last_watchpoint_addr;  // Address of last hit watchpoint
+    gdb_addr_t last_watchpoint_addr;  // Address of last hit watchpoint
     int last_stop_signal;           // Last stop signal sent
     bool breakpoint_hit;            // Flag indicating breakpoint was hit
     /* SMP thread state (GDB thread ids are 1-based hart ids). */
@@ -67,12 +91,12 @@ typedef struct {
 
 // Callback functions for simulator access
 typedef struct {
-    uint32_t (*read_reg)(void *sim, int reg_num);
-    void (*write_reg)(void *sim, int reg_num, uint32_t value);
-    uint32_t (*read_mem)(void *sim, uint32_t addr, int size);
-    void (*write_mem)(void *sim, uint32_t addr, uint32_t value, int size);
-    uint32_t (*get_pc)(void *sim);
-    void (*set_pc)(void *sim, uint32_t pc);
+    gdb_reg_t (*read_reg)(void *sim, int reg_num);
+    void (*write_reg)(void *sim, int reg_num, gdb_reg_t value);
+    gdb_reg_t (*read_mem)(void *sim, gdb_addr_t addr, int size);
+    void (*write_mem)(void *sim, gdb_addr_t addr, gdb_reg_t value, int size);
+    gdb_addr_t (*get_pc)(void *sim);
+    void (*set_pc)(void *sim, gdb_addr_t pc);
     void (*single_step)(void *sim);
     bool (*is_running)(void *sim);
     void (*reset)(void *sim);
@@ -99,28 +123,28 @@ int gdb_stub_process(gdb_context_t *ctx, void *simulator,
                      const gdb_callbacks_t *callbacks);
 
 // Check if should stop at current PC
-bool gdb_stub_check_breakpoint(gdb_context_t *ctx, uint32_t pc);
+bool gdb_stub_check_breakpoint(gdb_context_t *ctx, gdb_addr_t pc);
 
 // Close GDB stub
 void gdb_stub_close(gdb_context_t *ctx);
 
 // Helper functions
-int gdb_stub_add_breakpoint(gdb_context_t *ctx, uint32_t addr);
-int gdb_stub_remove_breakpoint(gdb_context_t *ctx, uint32_t addr);
+int gdb_stub_add_breakpoint(gdb_context_t *ctx, gdb_addr_t addr);
+int gdb_stub_remove_breakpoint(gdb_context_t *ctx, gdb_addr_t addr);
 void gdb_stub_clear_breakpoints(gdb_context_t *ctx);
 
 // Watchpoint functions
-int gdb_stub_add_watchpoint(gdb_context_t *ctx, uint32_t addr, uint32_t len, watchpoint_type_t type);
-int gdb_stub_remove_watchpoint(gdb_context_t *ctx, uint32_t addr, uint32_t len, watchpoint_type_t type);
-bool gdb_stub_check_watchpoint_read(gdb_context_t *ctx, uint32_t addr, uint32_t len);
-bool gdb_stub_check_watchpoint_write(gdb_context_t *ctx, uint32_t addr, uint32_t len);
+int gdb_stub_add_watchpoint(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len, watchpoint_type_t type);
+int gdb_stub_remove_watchpoint(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len, watchpoint_type_t type);
+bool gdb_stub_check_watchpoint_read(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len);
+bool gdb_stub_check_watchpoint_write(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len);
 void gdb_stub_clear_watchpoints(gdb_context_t *ctx);
 
 // Send stop signal to GDB
 int gdb_stub_send_stop_signal(gdb_context_t *ctx, int signal);
 
 // Enhanced stop reason reporting
-int gdb_stub_send_stop_reason(gdb_context_t *ctx, int signal, uint32_t addr);
+int gdb_stub_send_stop_reason(gdb_context_t *ctx, int signal, gdb_addr_t addr);
 
 // Record which thread (1-based hart id) caused a stop
 void gdb_stub_set_stop_thread(gdb_context_t *ctx, int thread_id);

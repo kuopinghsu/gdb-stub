@@ -1,7 +1,7 @@
 # Makefile for RISC-V Emulator with GDB Stub
 
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2 -g
+CFLAGS = -Wall -Wextra -std=c99 -O2 -g -DGDB_STUB_RISCV32
 LDFLAGS = 
 
 # RISC-V GDB binary (can be overridden: make GDB=/path/to/gdb demo)
@@ -99,7 +99,7 @@ define RUN_SMP_TEST
 	@./$(TARGET) -p 1234 -c $(1) & \
 	EMU_PID=$$!; \
 	sleep 2; \
-	riscv-none-elf-gdb -batch -ex 'set $$expected_harts=$(1)' -x gdb_test_smp.gdb || { kill $$EMU_PID 2>/dev/null; $(MAKE) stop-emu; exit 1; }; \
+	$(GDB) -batch -ex 'set $$expected_harts=$(1)' -x gdb_test_smp.gdb || { kill $$EMU_PID 2>/dev/null; $(MAKE) stop-emu; exit 1; }; \
 	kill $$EMU_PID 2>/dev/null || $(MAKE) stop-emu
 endef
 
@@ -160,7 +160,7 @@ test-smp: clean $(TARGET)
 HARTS ?= 1
 start-emu: $(TARGET)
 	@echo "Starting emulator on port 1234 ($(HARTS) hart(s))..."
-	@pkill -f rv32_emu || true
+	@pkill rv32_emu || true
 	@./$(TARGET) -p 1234 -c $(HARTS) &
 	@echo "Emulator started in background. Connect with:"
 	@echo "  $(GDB) -x gdb_demo.gdb examples/test.s"
@@ -172,7 +172,7 @@ start-emu: $(TARGET)
 # Stop the background emulator
 stop-emu:
 	@echo "Stopping emulator..."
-	@pkill -f rv32_emu || true
+	@pkill rv32_emu || true
 	@echo "Emulator stopped"
 
 # Connect to running emulator with GDB

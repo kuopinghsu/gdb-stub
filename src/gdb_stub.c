@@ -11,8 +11,23 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ctype.h>
+#include <inttypes.h>
 
 #define GDB_STUB_PID 1
+
+#if GDB_STUB_XLEN == 32
+    #define GDB_REG_HEX_BYTES 4
+    #define GDB_REG_HEX_CHARS 8
+    #define GDB_ADDR_HEX_FMT "%08" PRIx32
+    #define GDB_TARGET_ARCH "riscv:rv32"
+#elif GDB_STUB_XLEN == 64
+    #define GDB_REG_HEX_BYTES 8
+    #define GDB_REG_HEX_CHARS 16
+    #define GDB_ADDR_HEX_FMT "%016" PRIx64
+    #define GDB_TARGET_ARCH "riscv:rv64"
+#else
+    #error "Unsupported GDB_STUB_XLEN"
+#endif
 
 // Forward declarations for static functions
 static void handle_query(gdb_context_t *ctx, void *simulator, const gdb_callbacks_t *callbacks);
@@ -50,25 +65,25 @@ static char int_to_hex(uint8_t val) {
     return val < 10 ? '0' + val : 'a' + (val - 10);
 }
 
-static uint32_t parse_hex(const char *str, int len) {
-    uint32_t value = 0;
+static gdb_addr_t parse_hex(const char *str, int len) {
+    gdb_addr_t value = 0;
     for (int i = 0; i < len && str[i]; i++) {
         value = (value << 4) | hex_to_int(str[i]);
     }
     return value;
 }
 
-static uint32_t parse_hex_le(const char *str, int hex_chars) {
-    uint32_t value = 0;
+static gdb_reg_t parse_hex_le(const char *str, int hex_chars) {
+    gdb_reg_t value = 0;
     int bytes = hex_chars / 2;
     for (int i = 0; i < bytes && str[i * 2] && str[i * 2 + 1]; i++) {
         uint8_t byte = (hex_to_int(str[i * 2]) << 4) | hex_to_int(str[i * 2 + 1]);
-        value |= (uint32_t)byte << (i * 8);
+        value |= (gdb_reg_t)byte << (i * 8);
     }
     return value;
 }
 
-static void encode_hex(char *buf, uint32_t value, int bytes) {
+static void encode_hex(char *buf, gdb_reg_t value, int bytes) {
     // Encode in little-endian byte order (LSB first) for RISC-V
     for (int i = 0; i < bytes; i++) {
         uint8_t byte = (value >> (i * 8)) & 0xFF;
@@ -85,12 +100,12 @@ static uint8_t calculate_checksum(const char *data, int len) {
     return sum;
 }
 
-static bool ranges_overlap(uint32_t addr1, uint32_t len1, uint32_t addr2, uint32_t len2) {
+static bool ranges_overlap(gdb_addr_t addr1, gdb_addr_t len1, gdb_addr_t addr2, gdb_addr_t len2) {
     if (len1 == 0 || len2 == 0) {
         return false;
     }
-    uint64_t end1 = (uint64_t)addr1 + len1;
-    uint64_t end2 = (uint64_t)addr2 + len2;
+    uint64_t end1 = (uint64_t)addr1 + (uint64_t)len1;
+    uint64_t end2 = (uint64_t)addr2 + (uint64_t)len2;
     return addr1 < end2 && addr2 < end1;
 }
 
@@ -126,16 +141,16 @@ static int parse_thread_spec(const char *str, int *pid, int *tid) {
 
 static void format_stop_reply(gdb_context_t *ctx, char *response, size_t len,
                               int signal, int tid, bool swbreak,
-                              uint32_t watch_addr, uint32_t pc_addr) {
+                              gdb_addr_t watch_addr, gdb_addr_t pc_addr) {
     if (ctx->multiprocess_active) {
         if (swbreak) {
             snprintf(response, len, "T%02xthread:p%x.%x;swbreak:;",
                      signal & 0xFF, GDB_STUB_PID, tid);
         } else if (watch_addr != 0) {
-            snprintf(response, len, "T%02xthread:p%x.%x;watch:%08x;",
+            snprintf(response, len, "T%02xthread:p%x.%x;watch:" GDB_ADDR_HEX_FMT ";",
                      signal & 0xFF, GDB_STUB_PID, tid, watch_addr);
         } else if (pc_addr != 0) {
-            snprintf(response, len, "T%02xthread:p%x.%x;20:%08x;",
+            snprintf(response, len, "T%02xthread:p%x.%x;20:" GDB_ADDR_HEX_FMT ";",
                      signal & 0xFF, GDB_STUB_PID, tid, pc_addr);
         } else {
             snprintf(response, len, "T%02xthread:p%x.%x;",
@@ -148,10 +163,10 @@ static void format_stop_reply(gdb_context_t *ctx, char *response, size_t len,
         snprintf(response, len, "T%02xthread:%x;swbreak:;",
                  signal & 0xFF, tid);
     } else if (watch_addr != 0) {
-        snprintf(response, len, "T%02xthread:%x;watch:%08x;",
+        snprintf(response, len, "T%02xthread:%x;watch:" GDB_ADDR_HEX_FMT ";",
                  signal & 0xFF, tid, watch_addr);
     } else if (pc_addr != 0) {
-        snprintf(response, len, "T%02xthread:%x;20:%08x;",
+        snprintf(response, len, "T%02xthread:%x;20:" GDB_ADDR_HEX_FMT ";",
                  signal & 0xFF, tid, pc_addr);
     } else {
         snprintf(response, len, "T%02xthread:%x;",
@@ -406,7 +421,7 @@ static void handle_query(gdb_context_t *ctx, void *simulator,
         const char *xml = "l<?xml version=\"1.0\"?>"
                           "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
                           "<target version=\"1.0\">"
-                          "<architecture>riscv:rv32</architecture>"
+                          "<architecture>" GDB_TARGET_ARCH "</architecture>"
                           "</target>";
         send_packet(&ctx->stub, xml);
     } else if (strncmp(packet, "qOffsets", 8) == 0) {
@@ -443,15 +458,15 @@ static void handle_read_registers(gdb_context_t *ctx, void *simulator,
 
     // Send 33 registers (x0-x31 + pc)
     for (int i = 0; i < 32; i++) {
-        uint32_t value = callbacks->read_reg(simulator, i);
-        encode_hex(p, value, 4);
-        p += 8;
+        gdb_reg_t value = callbacks->read_reg(simulator, i);
+        encode_hex(p, value, GDB_REG_HEX_BYTES);
+        p += GDB_REG_HEX_CHARS;
     }
 
     // Add PC
-    uint32_t pc = callbacks->get_pc(simulator);
-    encode_hex(p, pc, 4);
-    p += 8;
+    gdb_addr_t pc = callbacks->get_pc(simulator);
+    encode_hex(p, (gdb_reg_t)pc, GDB_REG_HEX_BYTES);
+    p += GDB_REG_HEX_CHARS;
     *p = '\0';
 
     send_packet(&ctx->stub, response);
@@ -463,12 +478,12 @@ static void handle_write_registers(gdb_context_t *ctx, void *simulator,
     char *data = ctx->stub.packet_buffer + 1;
 
     for (int i = 0; i < 32; i++) {
-        uint32_t value = parse_hex_le(data + i * 8, 8);
+        gdb_reg_t value = parse_hex_le(data + i * GDB_REG_HEX_CHARS, GDB_REG_HEX_CHARS);
         callbacks->write_reg(simulator, i, value);
     }
 
     // Write PC
-    uint32_t pc = parse_hex_le(data + 32 * 8, 8);
+    gdb_addr_t pc = (gdb_addr_t)parse_hex_le(data + 32 * GDB_REG_HEX_CHARS, GDB_REG_HEX_CHARS);
     callbacks->set_pc(simulator, pc);
 
     send_packet(&ctx->stub, "OK");
@@ -485,10 +500,10 @@ static void handle_read_memory(gdb_context_t *ctx, void *simulator,
     }
 
     *comma = '\0';
-    uint32_t addr = parse_hex(packet, comma - packet);
-    uint32_t len = parse_hex(comma + 1, strlen(comma + 1));
+    gdb_addr_t addr = parse_hex(packet, comma - packet);
+    gdb_addr_t len = parse_hex(comma + 1, strlen(comma + 1));
 
-    if (len > GDB_BUFFER_SIZE / 2) {
+    if ((uint64_t)len > (uint64_t)(GDB_BUFFER_SIZE / 2)) {
         send_packet(&ctx->stub, "E02");
         return;
     }
@@ -496,7 +511,7 @@ static void handle_read_memory(gdb_context_t *ctx, void *simulator,
     char response[GDB_BUFFER_SIZE];
     char *p = response;
 
-    for (uint32_t i = 0; i < len; i++) {
+    for (gdb_addr_t i = 0; i < len; i++) {
         uint8_t byte = callbacks->read_mem(simulator, addr + i, 1) & 0xFF;
         *p++ = int_to_hex(byte >> 4);
         *p++ = int_to_hex(byte & 0xF);
@@ -521,11 +536,11 @@ static void handle_write_memory(gdb_context_t *ctx, void *simulator,
     *comma = '\0';
     *colon = '\0';
 
-    uint32_t addr = parse_hex(packet, comma - packet);
-    uint32_t len = parse_hex(comma + 1, colon - comma - 1);
+    gdb_addr_t addr = parse_hex(packet, comma - packet);
+    gdb_addr_t len = parse_hex(comma + 1, colon - comma - 1);
     char *data = colon + 1;
 
-    for (uint32_t i = 0; i < len; i++) {
+    for (gdb_addr_t i = 0; i < len; i++) {
         uint8_t byte = (hex_to_int(data[i * 2]) << 4) | hex_to_int(data[i * 2 + 1]);
         callbacks->write_mem(simulator, addr + i, byte, 1);
     }
@@ -548,8 +563,8 @@ static void handle_breakpoint(gdb_context_t *ctx, bool insert) {
     *comma2 = '\0';
 
     int type = parse_hex(packet, comma1 - packet);
-    uint32_t addr = parse_hex(comma1 + 1, comma2 - comma1 - 1);
-    uint32_t len = parse_hex(comma2 + 1, strlen(comma2 + 1));
+    gdb_addr_t addr = parse_hex(comma1 + 1, comma2 - comma1 - 1);
+    gdb_addr_t len = parse_hex(comma2 + 1, strlen(comma2 + 1));
 
     if ((type >= 2 && type <= 4) && len == 0) {
         len = 4;
@@ -592,8 +607,8 @@ static void handle_read_single_register(gdb_context_t *ctx, void *simulator,
         return;
     }
 
-    char response[16];
-    uint32_t value;
+    char response[32];
+    gdb_reg_t value;
 
     if (reg_num < 32) {
         value = callbacks->read_reg(simulator, reg_num);
@@ -604,8 +619,8 @@ static void handle_read_single_register(gdb_context_t *ctx, void *simulator,
         return;
     }
 
-    encode_hex(response, value, 4);
-    response[8] = '\0';
+    encode_hex(response, value, GDB_REG_HEX_BYTES);
+    response[GDB_REG_HEX_CHARS] = '\0';
     send_packet(&ctx->stub, response);
 }
 
@@ -622,7 +637,7 @@ static void handle_write_single_register(gdb_context_t *ctx, void *simulator,
 
     *equals = '\0';
     int reg_num = (int)parse_hex(packet, equals - packet);
-    uint32_t value = parse_hex_le(equals + 1, (int)strlen(equals + 1));
+    gdb_reg_t value = parse_hex_le(equals + 1, (int)strlen(equals + 1));
 
     if (reg_num < 0 || reg_num > 32) {
         send_packet(&ctx->stub, "E01");
@@ -685,8 +700,8 @@ static void handle_write_memory_binary(gdb_context_t *ctx, void *simulator,
     *comma = '\0';
     *colon = '\0';
 
-    uint32_t addr = parse_hex(packet, comma - packet);
-    uint32_t len = parse_hex(comma + 1, colon - comma - 1);
+    gdb_addr_t addr = parse_hex(packet, comma - packet);
+    uint32_t len = (uint32_t)parse_hex(comma + 1, colon - comma - 1);
     char *data = colon + 1;
 
     if (len == 0 || len > GDB_BUFFER_SIZE) {
@@ -700,7 +715,7 @@ static void handle_write_memory_binary(gdb_context_t *ctx, void *simulator,
         return;
     }
 
-    for (uint32_t i = 0; i < len; i++) {
+    for (gdb_addr_t i = 0; i < len; i++) {
         callbacks->write_mem(simulator, addr + i, bytes[i], 1);
     }
 
@@ -823,7 +838,7 @@ static void handle_halt_reason(gdb_context_t *ctx, void *simulator,
                           ctx->last_watchpoint_addr, 0);
         ctx->last_watchpoint_addr = 0;
     } else {
-        uint32_t pc = callbacks->get_pc(simulator);
+        gdb_addr_t pc = callbacks->get_pc(simulator);
         if (gdb_stub_check_breakpoint(ctx, pc)) {
             format_stop_reply(ctx, response, sizeof(response), 5, tid, true, 0, 0);
         } else {
@@ -968,19 +983,19 @@ static void handle_search_memory(gdb_context_t *ctx, void *simulator,
     *colon1 = '\0';
     *colon2 = '\0';
 
-    uint32_t start_addr = parse_hex(packet, colon1 - packet);
-    uint32_t search_len = parse_hex(colon1 + 1, colon2 - colon1 - 1);
+    gdb_addr_t start_addr = parse_hex(packet, colon1 - packet);
+    gdb_addr_t search_len = parse_hex(colon1 + 1, colon2 - colon1 - 1);
     char *pattern = colon2 + 1;
 
     int pattern_len = strlen(pattern) / 2; // Hex encoded pattern
 
-    if (pattern_len == 0 || search_len < (uint32_t)pattern_len) {
+    if (pattern_len == 0 || (uint64_t)search_len < (uint64_t)pattern_len) {
         send_packet(&ctx->stub, "0");
         return;
     }
 
     // Simple linear search implementation
-    for (uint32_t addr = start_addr; addr <= start_addr + search_len - pattern_len; addr++) {
+    for (gdb_addr_t addr = start_addr; addr <= start_addr + search_len - (gdb_addr_t)pattern_len; addr++) {
         bool match = true;
         for (int i = 0; i < pattern_len; i++) {
             uint8_t pattern_byte = (hex_to_int(pattern[i * 2]) << 4) | hex_to_int(pattern[i * 2 + 1]);
@@ -991,8 +1006,8 @@ static void handle_search_memory(gdb_context_t *ctx, void *simulator,
             }
         }
         if (match) {
-            char response[32];
-            snprintf(response, sizeof(response), "1,%08x", addr);
+            char response[48];
+            snprintf(response, sizeof(response), "1," GDB_ADDR_HEX_FMT, addr);
             send_packet(&ctx->stub, response);
             return;
         }
@@ -1145,7 +1160,7 @@ int gdb_stub_process(gdb_context_t *ctx, void *simulator,
 }
 
 // Breakpoint management
-int gdb_stub_add_breakpoint(gdb_context_t *ctx, uint32_t addr) {
+int gdb_stub_add_breakpoint(gdb_context_t *ctx, gdb_addr_t addr) {
     if (ctx->breakpoint_count >= MAX_BREAKPOINTS) {
         return -1;
     }
@@ -1164,7 +1179,7 @@ int gdb_stub_add_breakpoint(gdb_context_t *ctx, uint32_t addr) {
     return 0;
 }
 
-int gdb_stub_remove_breakpoint(gdb_context_t *ctx, uint32_t addr) {
+int gdb_stub_remove_breakpoint(gdb_context_t *ctx, gdb_addr_t addr) {
     for (int i = 0; i < ctx->breakpoint_count; i++) {
         if (ctx->breakpoints[i].addr == addr) {
             ctx->breakpoints[i].enabled = false;
@@ -1178,7 +1193,7 @@ void gdb_stub_clear_breakpoints(gdb_context_t *ctx) {
     ctx->breakpoint_count = 0;
 }
 
-bool gdb_stub_check_breakpoint(gdb_context_t *ctx, uint32_t pc) {
+bool gdb_stub_check_breakpoint(gdb_context_t *ctx, gdb_addr_t pc) {
     for (int i = 0; i < ctx->breakpoint_count; i++) {
         if (ctx->breakpoints[i].enabled && ctx->breakpoints[i].addr == pc) {
             ctx->breakpoint_hit = true;
@@ -1189,7 +1204,7 @@ bool gdb_stub_check_breakpoint(gdb_context_t *ctx, uint32_t pc) {
 }
 
 // Watchpoint management
-int gdb_stub_add_watchpoint(gdb_context_t *ctx, uint32_t addr, uint32_t len, watchpoint_type_t type) {
+int gdb_stub_add_watchpoint(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len, watchpoint_type_t type) {
     if (len == 0) {
         len = 4;
     }
@@ -1215,7 +1230,7 @@ int gdb_stub_add_watchpoint(gdb_context_t *ctx, uint32_t addr, uint32_t len, wat
     return 0;
 }
 
-int gdb_stub_remove_watchpoint(gdb_context_t *ctx, uint32_t addr, uint32_t len, watchpoint_type_t type) {
+int gdb_stub_remove_watchpoint(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len, watchpoint_type_t type) {
     for (int i = 0; i < ctx->watchpoint_count; i++) {
         if (ctx->watchpoints[i].addr == addr &&
             ctx->watchpoints[i].len == len &&
@@ -1232,7 +1247,7 @@ void gdb_stub_clear_watchpoints(gdb_context_t *ctx) {
 }
 
 // Check if memory read triggers a watchpoint
-bool gdb_stub_check_watchpoint_read(gdb_context_t *ctx, uint32_t addr, uint32_t len) {
+bool gdb_stub_check_watchpoint_read(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len) {
     for (int i = 0; i < ctx->watchpoint_count; i++) {
         if (!ctx->watchpoints[i].enabled) continue;
 
@@ -1248,7 +1263,7 @@ bool gdb_stub_check_watchpoint_read(gdb_context_t *ctx, uint32_t addr, uint32_t 
 }
 
 // Check if memory write triggers a watchpoint
-bool gdb_stub_check_watchpoint_write(gdb_context_t *ctx, uint32_t addr, uint32_t len) {
+bool gdb_stub_check_watchpoint_write(gdb_context_t *ctx, gdb_addr_t addr, gdb_addr_t len) {
     for (int i = 0; i < ctx->watchpoint_count; i++) {
         if (!ctx->watchpoints[i].enabled) continue;
 
@@ -1297,7 +1312,7 @@ bool gdb_stub_should_run_thread(gdb_context_t *ctx, int thread_id) {
     return ctx->continue_thread == thread_id;
 }
 
-int gdb_stub_send_stop_reason(gdb_context_t *ctx, int signal, uint32_t addr) {
+int gdb_stub_send_stop_reason(gdb_context_t *ctx, int signal, gdb_addr_t addr) {
     char response[128];
     int tid = ctx->stop_thread ? ctx->stop_thread : ctx->current_thread;
 
